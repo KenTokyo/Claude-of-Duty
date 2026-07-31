@@ -132,7 +132,7 @@ Agents just edited ${DIRS_WITH_CLOCK.join(', ')} concurrently:
 ${JSON.stringify(determinism.filter(Boolean), null, 2)}
 
 You may edit any file. Do this:
-1. npx vite build — fix until clean.
+1. pnpm build — fix until clean.
 2. Confirm the harness is still self-consistent (this must hold or nothing else
    is measurable):
      OW_NO_HMR=1 node tools/baseline.mjs --out=/tmp/v-a --port=5320
@@ -320,7 +320,7 @@ You may edit any file. Apply any sound cross-cutting changes the agents requeste
 pre-warm no longer needs to draw gameplay frames.
 
 Then produce the definitive verdict:
-1. npx vite build — clean.
+1. pnpm build — clean.
 2. THE GATE, over all 11 shots, against the pre-optimization baseline at
    ${ROOT}/shots/perf-base, which the 'Verify gate' phase captured AFTER the
    determinism fix and BEFORE any optimization (do NOT use shots/pw3-off — it

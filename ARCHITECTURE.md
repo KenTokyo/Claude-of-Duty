@@ -12,7 +12,7 @@ meshes, animation and audio are generated procedurally at load time.
    every other directory and your edit will be clobbered or will break them.
 2. **Never import another subsystem's module.** Get it at runtime:
    `const fx = ctx.get('fx')`. This is what makes parallel work safe.
-3. **No new npm dependencies.** `three` only. No CDN fetches, no external
+3. **No new package dependencies.** `three` only. No CDN fetches, no external
    images/HDRIs/models/audio files — the game must run fully offline.
 4. **No `Math.random()` in gameplay or visuals.** Use `ctx.rng` (see
    `src/core/rng.js`) or a `ctx.rng.fork()` you keep. Capture reproducibility
@@ -21,7 +21,7 @@ meshes, animation and audio are generated procedurally at load time.
    `init()` and reuse. A `new THREE.Vector3()` inside `update()` is a bug.
 6. **Dispose what you create.** Geometries, materials, textures and render
    targets get freed in `dispose()`.
-7. `npm run build` must pass and `node tools/capture.mjs` must produce a frame
+7. `pnpm build` must pass and `node tools/capture.mjs` must produce a frame
    after your change. If you break the boot, nobody else can work.
 
 ## Subsystem interface

@@ -10,8 +10,8 @@ procedurally at load time from code. No models, no HDRIs, no image files, no aud
 files. The only runtime dependency is `three`.
 
 ```bash
-npm install
-npm run dev          # http://127.0.0.1:5178
+pnpm install
+pnpm dev             # http://127.0.0.1:5178
 ```
 
 Click the canvas to lock the cursor. WASD move, mouse aim, LMB fire, RMB ADS,
