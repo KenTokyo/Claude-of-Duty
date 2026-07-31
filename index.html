@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <title>Overwatch - Claude of Duty</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/src/global.css" />
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+    <div id="ui"></div>
+    <div id="boot" role="status" aria-live="polite" aria-atomic="false" aria-busy="true" aria-labelledby="boot-status" lang="de">
+      <div class="boot-card">
+        <div class="boot-topline">
+          <div class="boot-kicker">OVERWATCH // SYSTEMSTART</div>
+          <div id="boot-percent" aria-hidden="true">2%</div>
+        </div>
+
+        <h1 id="boot-status">Systemstart wird vorbereitet …</h1>
+        <p id="boot-activity">Der Start beginnt gleich. Alle Schritte sind noch ausstehend.</p>
+
+        <div
+          id="boot-track"
+          class="boot-track"
+          role="progressbar"
+          aria-labelledby="boot-status"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow="2"
+          aria-valuetext="2 Prozent – Systemstart wird vorbereitet"
+        >
+          <div id="boot-progress"></div>
+        </div>
+        <div id="boot-detail">Performance-Profil wird ermittelt</div>
+
+        <div class="boot-list-heading">
+          <h2>Startschritte</h2>
+          <span>Live-Status</span>
+        </div>
+        <ol id="boot-steps" class="boot-steps" aria-label="Fortschritt der Startschritte">
+          <li class="boot-step is-pending" data-boot-step="render">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Renderer und Renderziele</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="materials">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Materialien und Texturen</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="sky">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Himmel und Beleuchtung</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="physics">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Physik</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="world">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Weltgeometrie</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="player">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Spieler</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="weapons">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Waffen</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="fx">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Effekte</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="ai">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Gegner und Navigation</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="ui">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Benutzeroberfläche</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="audio">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Audio</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="prewarm">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Shader vorbereiten</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+          <li class="boot-step is-pending" data-boot-step="first-frame">
+            <span class="boot-step-marker" aria-hidden="true"></span>
+            <span class="boot-step-label">Ersten Frame darstellen</span>
+            <span class="boot-step-state">Ausstehend</span>
+          </li>
+        </ol>
+
+        <noscript>
+          <p class="boot-noscript">JavaScript wird benötigt, um das Spiel zu starten.</p>
+        </noscript>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
