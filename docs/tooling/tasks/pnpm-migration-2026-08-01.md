@@ -17,7 +17,7 @@
 - [x] `package.json` und `package-lock.json` geprüft.
 - [x] Dokumentation und Tooling nach npm-/npx-Verweisen durchsucht.
 - [x] Installierte Node-, npm-, pnpm- und Corepack-Versionen geprüft.
-**Ergebnis:** Die Migration betrifft Paketmetadaten, Lockdatei, README und zwei Tooling-Anweisungen.
+**Ergebnis:** Die Migration betrifft Paketmetadaten, Lockdatei, README, Architekturvertrag und zwei Tooling-Anweisungen.
 **Warum:** Vollständige Suche verhindert gemischte npm-/pnpm-Befehle.
 **Eingehalten:** Keine UI- oder Browserprüfung, keine unnötige Architekturänderung, bestehende Versionsauflösung bleibt erhalten.
 **Architektur passt:** pnpm ersetzt nur die Paketverwaltung; Laufzeitcode und Vite-Aufbau bleiben unverändert.
@@ -42,22 +42,25 @@
 - `pnpm-lock.yaml`
 - `package-lock.json`
 
-### ⏳ Phase 3 — Befehle vereinheitlichen und Installation prüfen
+### ✅ Phase 3 — Befehle vereinheitlichen und Installation prüfen
 **Ziel:** Nutzer und interne Tooling-Anweisungen verwenden ausschließlich pnpm; die Lockdatei ist installierbar.
-- [ ] README-Startbefehle auf pnpm umstellen.
-- [ ] `npx vite build` in Tooling-Anweisungen durch das vorhandene pnpm-Build-Script ersetzen.
-- [ ] Suche nach verbliebenen aktiven npm-/npx-Verweisen wiederholen.
-- [ ] Installation mit eingefrorener pnpm-Lockdatei prüfen.
-- [ ] Abschlussabgleich gegen alle Userziele durchführen.
+- [x] README-Startbefehle auf pnpm umgestellt.
+- [x] `npx vite build` in Tooling-Anweisungen durch das vorhandene pnpm-Build-Script ersetzt.
+- [x] Architekturvertrag auf paketmanagerneutrale Abhängigkeitsregel und `pnpm build` aktualisiert.
+- [x] Erforderliches esbuild-Installationsscript über `pnpm.onlyBuiltDependencies` explizit erlaubt und ausgeführt.
+- [x] Suche nach verbliebenen aktiven npm-/npx-Verweisen wiederholt.
+- [x] Installation mit eingefrorener pnpm-Lockdatei geprüft.
+- [x] Produktions-Build über pnpm erfolgreich ausgeführt.
+- [x] Abschlussabgleich gegen alle Userziele durchgeführt.
 **Ergebnis:** Setup und Tooling sind konsistent auf pnpm ausgerichtet.
 **Warum:** Eine neue Lockdatei allein verhindert keine veralteten npm-Abläufe in Doku und Arbeitsanweisungen.
 **Eingehalten:** Keine Tests, kein Dev-Server, keine UI-Prüfung, UTF-8.
 **Architektur passt:** Bestehende Scripts bleiben die Befehlsquelle; Dokumentation ruft sie nur über pnpm auf.
-**Auffälligkeiten/Performance/Kritische Findings:** Keine bekannt.
+**Auffälligkeiten/Performance/Kritische Findings:** pnpm blockierte zunächst das esbuild-Postinstall-Script; die Abhängigkeit wurde gezielt freigegeben und erfolgreich neu gebaut.
 **Referenzen:**
+- `package.json`
 - `README.md`
 - `tools/workflows/perf.js`
-- `pnpm-lock.yaml`
 
 ## Kommentare
 
@@ -69,6 +72,11 @@
 ### Phase 2
 **Eingehalten:** Single Source of Truth ✅, aufgelöste Paketversionen beibehalten ✅, pnpm exakt deklariert ✅
 **Auffälligkeiten (nach Schwere):** Keine.
+
+### Phase 3
+**Eingehalten:** aktive Befehle vollständig migriert ✅, Frozen-Lockfile-Installation ✅, Produktions-Build ✅, kein Dev-Server/UI-Test ✅
+**Auffälligkeiten (nach Schwere):**
+1. 🟡 **Behoben:** esbuild-Postinstall war durch pnpm 10 zunächst blockiert; `pnpm.onlyBuiltDependencies` erlaubt ausschließlich dieses benötigte Script.
 
 ## Arbeitsprotokoll (append-only)
 
@@ -82,5 +90,10 @@
 **Entscheidungen:** pnpm 10.33.0 exakt gepinnt; npm-Lockdatei nach erfolgreichem Import gelöscht, damit nur eine Lockdatei maßgeblich bleibt.
 **Unsicher / Risiko:** Keine; direkte Abhängigkeiten blieben auf `three@0.180.0`, `playwright@1.61.1`, `pngjs@7.0.0` und `vite@7.3.6`.
 
+### Phase 3 — Status success
+**Dateien:** `README.md`, `ARCHITECTURE.md`, `tools/workflows/perf.js` — aktive Befehle auf pnpm vereinheitlicht; `package.json` — esbuild-Postinstall gezielt freigegeben.
+**Entscheidungen:** Vorhandenes `build`-Script wird als `pnpm build` aufgerufen; kein redundantes `pnpm-workspace.yaml` für das Einzelpaket angelegt.
+**Unsicher / Risiko:** Keine; `pnpm install --frozen-lockfile` und `pnpm build` endeten mit Exitcode 0. Browser-/Gameplay-Prüfung war nicht Teil der Paketmanager-Migration.
+
 ## Offene Fix-Punkte (aktuell)
-- [ ] npm-Lockdatei und aktive npm-/npx-Befehle vollständig entfernen.
+- [x] npm-Lockdatei und aktive npm-/npx-Befehle vollständig entfernt.
