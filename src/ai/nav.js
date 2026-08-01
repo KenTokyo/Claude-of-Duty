@@ -104,6 +104,12 @@ export class NavGrid {
     this.floor.fill(-Infinity);
     /** how enclosed a cell is: 0 open, 1 hemmed in — used for cover scoring */
     this.enclosure = new Uint8Array(n);
+    /** connected component per cell, -1 where blocked. See _buildRegions(). */
+    this.region = new Int32Array(n).fill(-1);
+    /** cell count per component, indexed by region id */
+    this.regionSize = [];
+    /** the biggest component — the level's actual walkable network */
+    this.mainRegion = -1;
 
     // A* working set
     this.gScore = new Float32Array(n);
@@ -181,8 +187,126 @@ export class NavGrid {
       }
     }
     this.walkableCount = walk;
+    this._buildRegions();
     this.buildMs = performance.now() - t0;
     return this;
+  }
+
+  /**
+   * Label every walkable cell with its connected component, flooding under
+   * EXACTLY the rules A* walks with — same 8 neighbours, same no-corner-cutting
+   * test, same max step. "Same region" therefore means "a route exists", and the
+   * converse is what makes this worth building.
+   *
+   * MEASURED on this level: 38742 walkable cells in 789 components — one street
+   * network of 29835 cells and 788 marooned rooftops, ledges, window sills and
+   * table tops. Two of the six garrison spawns snapped onto a 10-cell island,
+   * one patrol route point sat on it, and 340 of 1349 cover points were on
+   * something nobody could walk to. Every one of those requests ran A* until it
+   * had expanded its full 6000-node budget and then returned "no route": 1849
+   * failed solves in a 20 s run, which is also what starved everyone else's
+   * per-frame path budget. With the labels the same question is an integer
+   * compare, and callers can ask for goals they can actually reach.
+   */
+  _buildRegions() {
+    const region = this.region;
+    region.fill(-1);
+    this.regionSize.length = 0;
+    const stack = this._regionStack ?? (this._regionStack = []);
+    for (let iz = 0; iz < this.nz; iz++) {
+      for (let ix = 0; ix < this.nx; ix++) {
+        const seed = this.index(ix, iz);
+        if (this.flags[seed] === 0 || region[seed] >= 0) continue;
+        const id = this.regionSize.length;
+        let count = 0;
+        stack.length = 0;
+        stack.push(seed);
+        region[seed] = id;
+        while (stack.length) {
+          const cur = stack.pop();
+          count++;
+          const cx = cur % this.nx, cz = (cur / this.nx) | 0;
+          const cy = this.floor[cur];
+          for (let d = 0; d < 8; d++) {
+            const dx = DX[d], dz = DZ[d];
+            const jx = cx + dx, jz = cz + dz;
+            if (!this.walkable(jx, jz)) continue;
+            if (dx && dz && (!this.walkable(cx + dx, cz) || !this.walkable(cx, cz + dz))) continue;
+            const j = this.index(jx, jz);
+            if (region[j] >= 0) continue;
+            if (Math.abs(this.floor[j] - cy) > this.maxStep) continue;
+            region[j] = id;
+            stack.push(j);
+          }
+        }
+        this.regionSize.push(count);
+      }
+    }
+    let best = -1;
+    for (let i = 0; i < this.regionSize.length; i++) {
+      if (best < 0 || this.regionSize[i] > this.regionSize[best]) best = i;
+    }
+    this.mainRegion = best;
+    return this;
+  }
+
+  /** Which component a world point belongs to, or -1 if nothing is near it. */
+  regionAt(x, z, y = null, maxRings = 4) {
+    const i = this.nearest(x, z, y, maxRings);
+    return i < 0 ? -1 : this.region[i];
+  }
+
+  /**
+   * The component someone standing here can actually WORK in — which is not the
+   * same question as `regionAt`, and the difference is a man who never moves.
+   *
+   * 749 of this level's 789 components are nine cells or fewer: crate lids,
+   * doorsteps, kerbs, the flat top of a sandbag wall. `regionAt` answers such a
+   * spot with that island's id, honestly, and every region-filtered query the
+   * agent then makes can only answer "nothing". MEASURED over 60 s: one of six
+   * men ran onto an 8-cell island (5 m², holding no cover points at all) at
+   * second 16 and did not move again for 43 s — all 1349 cover points were
+   * rejected on the region test alone, and the CoverMap was re-scanned for him
+   * 60 times a second to keep saying so.
+   *
+   * So: an island smaller than `minSize` is somewhere a man is standing, not
+   * somewhere he lives, and the region his queries should use is the network
+   * beside it. Nearer beats bigger — the loop stops at the first ring that
+   * offers a real network.
+   *
+   * `maxRings` is how far to look for ANY walkable cell, which is the caller's
+   * business: a spawn point floating half a metre off the kerb needs a wider
+   * net than a man who is standing on the ground. How far to look for a bigger
+   * NETWORK is not the caller's business — it is pinned to UPGRADE_RINGS,
+   * because `findPath` re-anchors a start cell exactly that far out into the
+   * goal's component (see the re-anchor beside `this.region[start]`). Name a
+   * region further away than that and the pathfinder cannot put the man into
+   * it, which is the 43-second freeze above with a new signature.
+   */
+  operatingRegion(x, z, y = null, maxRings = 3, minSize = 10) {
+    const UPGRADE_RINGS = 3;
+    const i = this.nearest(x, z, y, maxRings);
+    if (i < 0) return -1;
+    let best = this.region[i];
+    let bestSize = this.regionSize[best] ?? 0;
+    if (bestSize >= minSize) return best;
+    const cx = this.cellX(x), cz = this.cellZ(z);
+    for (let ring = 1; ring <= UPGRADE_RINGS; ring++) {
+      for (let dz = -ring; dz <= ring; dz++) {
+        for (let dx = -ring; dx <= ring; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== ring) continue;
+          if (!this.walkable(cx + dx, cz + dz)) continue;
+          const r = this.region[this.index(cx + dx, cz + dz)];
+          const size = this.regionSize[r] ?? 0;
+          if (size > bestSize) {
+            bestSize = size;
+            best = r;
+          }
+        }
+      }
+      if (bestSize >= minSize) break;
+    }
+    return best;
   }
 
   walkable(ix, iz, crouch = true) {
@@ -198,11 +322,14 @@ export class NavGrid {
   /**
    * Nearest walkable cell to a world point, searched in rings. Pass `y` plus a
    * `yTol` to reject cells on a different storey — otherwise a spawn point in a
-   * street happily snaps onto a market stall's table top.
+   * street happily snaps onto a market stall's table top. Pass `region` to
+   * demand a cell somebody standing in that component can actually walk to.
    */
-  nearest(x, z, y = null, maxRings = 8, yTol = Infinity) {
+  nearest(x, z, y = null, maxRings = 8, yTol = Infinity, region = -1) {
     const cx = this.cellX(x), cz = this.cellZ(z);
-    const okY = (i) => y === null || Math.abs(this.floor[i] - y) <= yTol;
+    const okY = (i) =>
+      (y === null || Math.abs(this.floor[i] - y) <= yTol) &&
+      (region < 0 || this.region[i] === region);
     if (this.walkable(cx, cz) && okY(this.index(cx, cz))) return this.index(cx, cz);
     for (let ring = 1; ring <= maxRings; ring++) {
       let best = -1, bestD = Infinity;
@@ -227,13 +354,41 @@ export class NavGrid {
   }
 
   /**
+   * Move a world point onto the walkable set, in place. Returns false when
+   * there is nothing walkable within `maxRings` — the caller's point is not a
+   * destination and asking A* about it is a wasted flood.
+   *
+   * This is what a raw geometric goal — "fifteen metres to my left" — has to
+   * pass through before it is a place a man can stand. findPath() does snap the
+   * goal itself, but with no region and no storey filter, so a point inside a
+   * building happily lands on its ROOF, in another component, and the solve
+   * then returns 0. MEASURED: 11 of 14 flank manoeuvres died exactly there.
+   */
+  snapTo(out, maxRings = 8, yTol = Infinity, region = -1) {
+    const i = this.nearest(out.x, out.z, out.y, maxRings, yTol, region);
+    if (i < 0) return false;
+    const iz = (i / this.nx) | 0;
+    out.set(this.worldX(i - iz * this.nx), this.floor[i], this.worldZ(iz));
+    return true;
+  }
+
+  /**
    * A* between two world points. Writes world-space waypoints into `out`
    * (an array of THREE.Vector3, reused) and returns the count.
    */
   findPath(from, to, out, opts = {}) {
-    const start = this.nearest(from.x, from.z, from.y);
+    let start = this.nearest(from.x, from.z, from.y);
     const goal = this.nearest(to.x, to.z, to.y);
     if (start < 0 || goal < 0) return 0;
+    // Different components: no route exists, and proving that the long way costs
+    // a full 6000-node flood every time it is asked. An agent standing one cell
+    // onto a kerb or a doorstep is the common false negative, so re-anchor the
+    // START inside the goal's component before giving up — the DESTINATION is
+    // the caller's to choose and is never quietly moved.
+    if (this.region[start] !== this.region[goal]) {
+      start = this.nearest(from.x, from.z, from.y, 3, Infinity, this.region[goal]);
+      if (start < 0) return 0;
+    }
     if (start === goal) {
       this._emit(out, 0, to);
       return 1;
@@ -250,6 +405,12 @@ export class NavGrid {
     this.came[start] = -1;
     this.visitStamp[start] = stamp;
     this.open.push(start, 0);
+
+    // Closest we ever got, for the partial path below.
+    const startH = (Math.max(Math.abs((start % nx) - gx), Math.abs(((start / nx) | 0) - gz)) +
+      (SQRT2 - 1) * Math.min(Math.abs((start % nx) - gx), Math.abs(((start / nx) | 0) - gz))) * cell;
+    let bestNode = -1;
+    let bestH = startH;
 
     let expanded = 0;
     let found = false;
@@ -285,21 +446,52 @@ export class NavGrid {
         this.came[ni] = cur;
         const hx = Math.abs(ix - gx), hz = Math.abs(iz - gz);
         const h = (Math.max(hx, hz) + (SQRT2 - 1) * Math.min(hx, hz)) * cell;
+        if (h < bestH) {
+          bestH = h;
+          bestNode = ni;
+        }
         this.open.push(ni, g + h * 1.06);
       }
     }
-    if (!found) return 0;
+
+    // Out of nodes, or out of frontier. Walk to the closest place we DID reach
+    // rather than reporting failure and leaving the caller standing.
+    //
+    // Every node in the tree is reachable from `start` by construction, and the
+    // region test above has already proved the goal itself is, so a partial path
+    // is never a walk toward somewhere unreachable — it is the first leg of a
+    // route the node budget could not finish in one solve. MEASURED: a flank
+    // goal 9.7 m away in a straight line, 17 waypoints away by road, exhausted
+    // the 6000-node budget and returned nothing; the agent had already paid the
+    // dice for that manoeuvre and stood still instead of making it. Doubling the
+    // budget would double the cost of every hard solve to fix that one; walking
+    // the leg we found costs nothing and closes the gap for the next ask.
+    //
+    // The floor is what stops a "partial" that goes nowhere from becoming a
+    // re-solve treadmill, and it has to be a real walk, not a step. MEASURED
+    // with a half-cell floor: a partial that closed 0.57 m had its man arrive
+    // inside `arriveEps` on the next frame, which reads to `_combat` as "reached
+    // the end of the path and still not in cover", so it dropped the point, took
+    // the same one again and asked again — ten times, 6.5 s, nobody moving.
+    // Two and a half cells clears the arrival radius and the cover radius both.
+    let end = goal;
+    if (!found) {
+      if (bestNode < 0 || startH - bestH < cell * 2.5) return 0;
+      end = bestNode;
+    }
 
     // walk the parents back, then string-pull
     const raw = this._raw ?? (this._raw = []);
     raw.length = 0;
-    let n = goal;
+    let n = end;
     while (n >= 0) {
       raw.push(n);
       n = this.came[n];
     }
     raw.reverse();
-    return this._stringPull(raw, from, to, out);
+    if (found) return this._stringPull(raw, from, to, out);
+    const last = this._p1.set(this.worldX(end % nx), this.floor[end], this.worldZ((end / nx) | 0));
+    return this._stringPull(raw, from, last, out);
   }
 
   _emit(out, i, v) {
@@ -362,6 +554,9 @@ export class NavGrid {
 const DX = [1, -1, 0, 0, 1, 1, -1, -1];
 const DZ = [0, 0, 1, -1, 1, -1, 1, -1];
 
+/** Radius around a squad casualty that cover scoring treats as a kill zone. */
+const DANGER_R = 6;
+
 /* ------------------------------------------------------------------ */
 /* Cover                                                               */
 /* ------------------------------------------------------------------ */
@@ -416,6 +611,10 @@ export class CoverMap {
             dx, dz, // direction the cover faces (toward the blocker)
             high,
             dist: low.distance,
+            // which walkable network this point belongs to: 340 of the 1349
+            // points on this level sit on ledges and rooftops nobody on the
+            // street can reach, and running at one is a man standing still
+            region: g.region[i],
             claimed: -1,
             score: 0,
           });
@@ -430,8 +629,9 @@ export class CoverMap {
   /**
    * Best cover for an agent at `pos` against a threat at `threat`.
    * Scoring, in order of weight: does the blocker actually sit between us and
-   * the threat, is the spot a sensible distance from both, is it free, and does
-   * a peek from it have line of sight (a hole to shoot through).
+   * the threat, is the spot a sensible distance from both, is it free, does a
+   * peek from it have line of sight (a hole to shoot through), and did one of
+   * ours just die there.
    */
   pick(pos, threat, opts = {}) {
     const wantMin = opts.minRange ?? 6;
@@ -441,11 +641,19 @@ export class CoverMap {
     const maxTravel = opts.maxTravel ?? 22;
     const yRef = opts.yRef ?? null;
     const yTol = opts.yTol ?? Infinity;
+    /** only points on this walkable network — see the `region` field */
+    const region = opts.region ?? -1;
+    /** the point we are already on, when the agent wants to move off it */
+    const exclude = opts.exclude ?? null;
+    /** where a squadmate was killed: the player owns that lane, see below */
+    const danger = opts.danger ?? null;
     let best = null;
     let bestScore = -Infinity;
     const tx = threat.x, tz = threat.z;
     for (let i = 0; i < this.points.length; i++) {
       const p = this.points[i];
+      if (p === exclude) continue;
+      if (region >= 0 && p.region !== region) continue;
       if (p.claimed >= 0 && p.claimed !== claimId) continue;
       const toThreatX = tx - p.x, toThreatZ = tz - p.z;
       const dT = Math.hypot(toThreatX, toThreatZ);
@@ -461,6 +669,14 @@ export class CoverMap {
       if (dT < wantMin) score -= (wantMin - dT) * 0.55;
       else if (dT > wantMax) score -= (dT - wantMax) * 0.28;
       score -= travel * 0.16;
+      // A spot one of ours was just shot on is a spot the threat has a firing
+      // lane onto. This is a penalty and not a filter on purpose: if the only
+      // cover left is beside the body, standing behind it still beats standing
+      // in the open — but anything else wins first.
+      if (danger) {
+        const dd = Math.hypot(p.x - danger.x, p.z - danger.z);
+        if (dd < DANGER_R) score -= (DANGER_R - dd) * 1.1;
+      }
       // do not bunch up
       if (squad) {
         for (const other of squad) {

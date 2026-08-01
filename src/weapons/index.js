@@ -601,7 +601,11 @@ export class WeaponSystem {
     if (this._sinceShot > 0.6) this._shotIndex = 0;
 
     // ---- gather state ----------------------------------------------------
-    const live = !input.frozen && input.enabled !== false && this.debugMode === null;
+    // A dead player does not reload, swap or hold the trigger. `controlEnabled`
+    // covers the pause menu and cutscenes as well, so this is one gate, not two.
+    const live =
+      !input.frozen && input.enabled !== false && this.debugMode === null &&
+      player?.dead !== true && player?.controlEnabled !== false;
     st.ads = live ? input.ads || player?.adsRequested === true : this.debugMode === 'ads';
     st.sprint = live ? player?.sprinting === true && this._sinceShot > 0.3 : false;
     st.speed = player?.horizontalSpeed ?? player?.speed ?? 0;

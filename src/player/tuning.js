@@ -62,6 +62,25 @@ export const MOVE = {
   adsScale: 0.5,
 
   /**
+   * Crouch is a hybrid: hold it longer than this and it behaves as hold-to-
+   * crouch (release stands you back up); tap it faster and it toggles.
+   * 0.2 s is the value MWII ships and it is far enough below a deliberate hold
+   * that neither half of the behaviour is reachable by accident.
+   */
+  crouchHold: 0.2,
+
+  /**
+   * Pure lateral input gets its own, higher acceleration.
+   *
+   * A strafe is a direction CHANGE, not a start from rest: the velocity you are
+   * fighting is perpendicular to the one you want, so the shared groundAccel
+   * spends its whole budget cancelling the old vector and the first ~120 ms of
+   * every A/D tap reads as mush. CoD's counter-strafe is near-instant, which is
+   * what makes peeking a corner feel like aiming rather than steering.
+   */
+  strafeAccelScale: 1.45,
+
+  /**
    * Ground response. 92 m/s^2 reaches base run speed in 50 ms — effectively
    * instant, which is what makes CoD feel "tight". Deceleration is deliberately
    * lower so there is a short slide-off tail instead of a dead stop.
@@ -258,6 +277,19 @@ export const HEALTH = {
   regenDelay: 4.6,
   regenRate: 34,
   regenRamp: 0.55,
+  /**
+   * …but the clock is "out of contact", not merely "un-hit". Rounds cracking
+   * past feed `suppression` (0.28 per near miss, decaying at 0.62/s), so while
+   * this threshold is exceeded you are still being shot at and still do not
+   * heal. Without it you can lean out of cover, be missed for five seconds
+   * straight and refill anyway.
+   *
+   * Sized against the pool rather than picked: one stray round (0.28, gone in
+   * 0.45 s) buys ~0.26 s of hold and must not lock healing out on its own,
+   * while sustained fire saturates the pool and keeps it held for ~1.4 s after
+   * the last round goes past. That asymmetry is the whole point.
+   */
+  regenSuppressionHold: 0.12,
   lowThreshold: 0.36,
   criticalThreshold: 0.18,
   /** Directional damage indicators live this long. */

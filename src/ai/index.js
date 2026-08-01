@@ -11,8 +11,8 @@
  *   soldier.js    variant assembly -> one skinned geometry + material list
  *   clips.js      hand-authored pose layers (idle/walk/run/crouch/hit/recoil…)
  *   animator.js   layered blending + aim, look-at, arm and foot IK
- *   nav.js        walkability grid from the physics BVH, A*, string pulling,
- *                 cover point extraction and scoring
+ *   nav.js        walkability grid from the physics BVH, connected-component
+ *                 labelling, A*, string pulling, cover extraction and scoring
  *   agent.js      one enemy: senses, state machine, gun, hit zones, death
  *   squad.js      peek rotation, contact sharing, flank and grenade rationing
  *
@@ -27,9 +27,19 @@
  *                                            pathsDeferred, lodIrrelevant }
  *
  * FRAME BUDGETS — navigation and the garrison are built during init(), not on
- * the first frame of play; A* is rationed to `ai.pathsPerFrame` solves per frame;
- * and an actor that provably cannot reach a pixel this frame (see
+ * the first frame of play; A* is rationed to `ai.pathsPerFrame` solves per frame
+ * and handed out in request order by `_servePathQueue`, never in agent-array
+ * order; and an actor that provably cannot reach a pixel this frame (see
  * `_updateRelevance`) animates at a third rate and leaves the shadow cascades.
+ *
+ * REACHABILITY is not assumed anywhere. `NavGrid` labels every walkable cell
+ * with its connected component, and spawns, patrol routes and cover points are
+ * all chosen inside the one the player is standing on. This level's grid is 789
+ * components — one street network and 788 marooned rooftops and ledges — so
+ * without it a third of the garrison spawns somewhere it can never walk out of.
+ *
+ * BODIES lie where they fall for `ai.corpseLinger` seconds, fade over
+ * `ai.corpseFade`, and are then disposed and dropped from `ai.agents`.
  *
  * EVENTS consumed: weapon:fire, bullet:impact, damage:dealt, explosion,
  *   player:footstep
@@ -113,6 +123,12 @@ export class AiSystem {
      *  ask for six of them at once. */
     this.pathsPerFrame = 2;
     this.stats.pathsDeferred = 0;
+    /** agents whose solve the budget deferred, oldest first — _servePathQueue */
+    this._pathQueue = [];
+    /** seconds a body lies where it fell before it starts to go */
+    this.corpseLinger = 9;
+    /** seconds the fade itself takes */
+    this.corpseFade = 2.5;
     this._frustum = new THREE.Frustum();
     this._mvp = new THREE.Matrix4();
     this._sphere = new THREE.Sphere();
@@ -342,6 +358,11 @@ export class AiSystem {
         const f = 1 - d / radius;
         this._v.copy(a.position).sub(e.position).normalize();
         a.suppress(1.4 * f);
+        // A frag thrown at the player still makes his own side dive for cover —
+        // but it does not wound them. MEASURED once the agents started closing
+        // on the player: single hits of 80, 49 and 39 damage from squadmates'
+        // grenades. A thrown weapon is aimed, and men do not frag their own.
+        if (e.source?.team === a.team) continue;
         a.applyDamage((e.damage ?? 100) * f * f, 'torso', a.eye, this._v);
       }
     });
@@ -489,22 +510,46 @@ export class AiSystem {
     const spawns = world?.spawnPoints ?? [];
     if (!spawns.length || !this.grid) return 0;
     const player = this.playerPosition(this._v3).clone();
+    // The walkable network the player is standing on. A spawn point that snaps
+    // onto a rooftop or a market stall is a soldier who can never path anywhere
+    // — MEASURED: two of six spawned onto a 10-cell island and stood there for
+    // the whole round. Everything below is chosen inside this one component.
+    //
+    // `operatingRegion` and not `regionAt`, for the reason spelled out on it:
+    // 749 of this level's 789 components are a kerb or a crate lid, and naming
+    // one of those here rejects every genuine spawn point on the region test.
+    // MEASURED on this level: the two answers agree for the player and for all
+    // eight spawn points, so this changes no placement today — it is the same
+    // trap `_combat` fell into, closed before a level or a seed springs it.
+    const grid = this.grid;
+    const region = grid.operatingRegion(player.x, player.z, player.y - 1.35, 6);
     // rank the spawn points by distance from the player, take the far half
-    const ranked = spawns
+    const inRegion = (e) =>
+      region < 0 || grid.operatingRegion(e.s.position.x, e.s.position.z, e.s.position.y, 4) === region;
+    const all = spawns
       .map((s, i) => ({ s, i, d: s.position.distanceTo(player) }))
       .sort((a, b) => b.d - a.d)
       .filter((e) => e.d > 18);
+    // never garrison an empty level because the reachability filter was strict
+    const reachable = all.filter(inRegion);
+    const ranked = reachable.length ? reachable : all;
     if (!ranked.length) return 0;
 
     const variants = ['vanguard', 'irregular', 'breacher'];
     const squads = opts.squads ?? 2;
     const per = opts.perSquad ?? 3;
     let made = 0;
+    // A route point is only a route point if the men on it can walk to it.
+    const onRoute = (v) => {
+      const ci = grid.nearest(v.x, v.z, v.y, 8, Infinity, region);
+      if (ci >= 0) v.set(grid.worldX(ci % grid.nx), grid.floor[ci], grid.worldZ((ci / grid.nx) | 0));
+      return v;
+    };
     for (let q = 0; q < squads && q < ranked.length; q++) {
       const squad = this.createSquad();
       const anchor = ranked[q % ranked.length].s;
       // patrol route: this spawn point and the two next-nearest ones
-      const route = [anchor.position.clone()];
+      const route = [onRoute(anchor.position.clone())];
       const others = ranked
         .filter((e) => e.s !== anchor)
         .sort(
@@ -512,7 +557,7 @@ export class AiSystem {
             a.s.position.distanceTo(anchor.position) - b.s.position.distanceTo(anchor.position)
         )
         .slice(0, 2);
-      for (const o of others) route.push(o.s.position.clone());
+      for (const o of others) route.push(onRoute(o.s.position.clone()));
 
       for (let m = 0; m < per; m++) {
         const jitterA = this.rng.range(0, Math.PI * 2);
@@ -520,13 +565,10 @@ export class AiSystem {
         const p = anchor.position
           .clone()
           .add(new THREE.Vector3(Math.cos(jitterA) * jitterR, 0, Math.sin(jitterA) * jitterR));
-        const ci = this.grid.nearest(p.x, p.z, anchor.position.y, 6, 1.4);
+        let ci = grid.nearest(p.x, p.z, anchor.position.y, 6, 1.4, region);
+        if (ci < 0) ci = grid.nearest(anchor.position.x, anchor.position.z, anchor.position.y, 12, Infinity, region);
         if (ci >= 0) {
-          p.set(
-            this.grid.worldX(ci % this.grid.nx),
-            this.grid.floor[ci],
-            this.grid.worldZ((ci / this.grid.nx) | 0)
-          );
+          p.set(grid.worldX(ci % grid.nx), grid.floor[ci], grid.worldZ((ci / grid.nx) | 0));
         } else {
           p.y = this.groundAt(p.x, p.z, anchor.position.y + 4);
         }
@@ -733,8 +775,10 @@ export class AiSystem {
       if (!this._navPending && (!ctx.config.deterministic || this.forcePopulate)) this.populate();
     }
 
-    // Per-frame A* budget: see requestPath().
+    // Per-frame A* budget: see requestPath(). The men who have been waiting
+    // longest get it first, before anybody asks for a new one this frame.
     this._pathBudget = this.pathsPerFrame;
+    this._servePathQueue();
     this._updateRelevance(ctx);
 
     for (const s of this.squads) s.update(dt);
@@ -756,6 +800,18 @@ export class AiSystem {
               `${(b.maxy - b.miny).toFixed(2)} x ${(b.maxz - b.minz).toFixed(2)} m ` +
               `at y=${b.miny.toFixed(2)} sleeping=${a.ragdoll.sleeping}`
           );
+        }
+        // The body falls, lies there long enough to be walked past and shot at,
+        // then goes. Without this the corpses accumulate for the whole session:
+        // every one keeps a ragdoll in the solver, seven hit capsules' worth of
+        // disposed colliders and a 25k-triangle skinned draw with its shadow.
+        if (a.deadTime > this.corpseLinger) {
+          a.beginFade();
+          if (a.updateFade(a.deadTime - this.corpseLinger, this.corpseFade)) {
+            a.dispose();
+            this.agents.splice(i, 1);
+            i--;
+          }
         }
       }
     }
@@ -786,14 +842,42 @@ export class AiSystem {
    * frame, which is invisible at 60 Hz and turns a squad-wide repath (six solves,
    * ~5 ms, on the frame the player opens fire) into two solves per frame.
    */
-  requestPath(from, dest, out) {
+  requestPath(from, dest, out, opts) {
     if (!this.grid) return 0;
     if (this._pathBudget <= 0) {
       this.stats.pathsDeferred++;
       return -1;
     }
     this._pathBudget--;
-    return this.grid.findPath(from, dest, out);
+    return this.grid.findPath(from, dest, out, opts);
+  }
+
+  /** Remember an agent whose solve was deferred. Once — order is its place. */
+  queuePath(agent) {
+    if (this._pathQueue.indexOf(agent) < 0) this._pathQueue.push(agent);
+  }
+
+  /**
+   * Hand out this frame's A* budget in the order the requests were made.
+   *
+   * WHY A QUEUE AND NOT "ASK AGAIN NEXT FRAME": the agent loop runs in array
+   * order, so a budget of two was spent by agents 1 and 2 before agent 4 ever
+   * got to ask, every frame, for ever. MEASURED on the six-man garrison: agents
+   * 4, 5 and 6 sat at speed 0 with `pathPending` set for the whole 20 s run and
+   * 2639 requests were thrown away. Position in this queue is a wait, not a
+   * race, and an agent that is already waiting no longer re-asks every frame —
+   * which is where most of those 2639 came from.
+   */
+  _servePathQueue() {
+    const q = this._pathQueue;
+    let i = 0;
+    while (i < q.length && this._pathBudget > 0) {
+      const a = q[i];
+      if (a.alive && a.pathPending) a._goTo(a._pendingDest);
+      // budget spent mid-serve leaves it pending: keep its place for next frame
+      if (a.alive && a.pathPending) i++;
+      else q.splice(i, 1);
+    }
   }
 
   /** Unit vector pointing AT the sun, however the sky exposes itself. */
@@ -856,7 +940,11 @@ export class AiSystem {
       }
       a.lodIrrelevant = !visible;
       if (!visible) irrelevant++;
-      a.mesh.userData.owNoShadow = !visible;
+      // A body part-way through its fade must not go on casting a hard, fully
+      // opaque shadow: the cascades draw with an override material and never
+      // read `.opacity`, so the only way out of them is this flag — which is
+      // also why it has to be re-asserted here, every frame, over the LOD's.
+      a.mesh.userData.owNoShadow = !visible || a.fadeOpacity !== undefined;
     }
     this._lodStats.irrelevant = irrelevant;
     this.stats.lodIrrelevant = irrelevant;
@@ -1093,6 +1181,7 @@ export class AiSystem {
     for (const a of this.agents) a.dispose();
     this.agents.length = 0;
     this.squads.length = 0;
+    this._pathQueue.length = 0;
     for (const g of this._grenades) {
       this.phys?.removeRigidBody(g.body);
       this.root.remove(g.mesh);

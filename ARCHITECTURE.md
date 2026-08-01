@@ -88,6 +88,11 @@ Emit and listen via `ctx.events`. Payloads are plain objects. The canonical set:
 | `player:land` | `{ velocity, surface }` | player |
 | `player:footstep` | `{ position, surface, running }` | player |
 | `player:state` | `{ stance, sprinting, sliding, ads }` | player |
+| `player:death` | `{ position }` | player (health) |
+| ↳ | fired the instant health crosses zero. It is the *fact*; `player:defeat` is the round ending. | |
+| `player:defeat` | `{ position, health, elapsed }` | player |
+| ↳ | the round is over: controls are off, the hitbox is down and the camera is collapsing. This is what `ui` waits for before drawing the death screen. | |
+| `player:respawn` | `{ position }` | player |
 | `explosion` | `{ position, radius, damage }` | any |
 | `resize` | `{ width, height }` | engine |
 

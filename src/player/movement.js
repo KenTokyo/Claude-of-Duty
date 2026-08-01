@@ -100,11 +100,15 @@ export class Movement {
     this.cmd = {
       moveX: 0, moveY: 0,
       jump: false, jumpHeld: false,
-      crouchPressed: false, cronePressed: false, pronePressed: false,
+      crouchPressed: false, crouchHeld: false, crouchReleased: false,
+      pronePressed: false,
       sprintHeld: false, sprintPressed: false,
       leanL: false, leanR: false,
       ads: false,
     };
+    /** Hybrid crouch: hold = crouch while held, tap = toggle. See _updateStance. */
+    this._crouchHoldTime = 0;
+    this._crouchStanceOnPress = 'stand';
     this._cmdFrame = -1;
     this._prevHeld = {
       jump: false, crouch: false, prone: false, sprint: false,
@@ -189,7 +193,8 @@ export class Movement {
     if (!this.controlEnabled) {
       cmd.moveX = 0; cmd.moveY = 0;
       cmd.jump = false; cmd.jumpHeld = false;
-      cmd.crouchPressed = false; cmd.pronePressed = false;
+      cmd.crouchPressed = false; cmd.crouchHeld = false; cmd.crouchReleased = false;
+      cmd.pronePressed = false;
       cmd.sprintHeld = false; cmd.sprintPressed = false;
       cmd.leanL = false; cmd.leanR = false;
       cmd.ads = false;
@@ -209,6 +214,8 @@ export class Movement {
     cmd.jump = jump && !prev.jump;
     cmd.jumpHeld = jump;
     cmd.crouchPressed = crouch && !prev.crouch;
+    cmd.crouchReleased = !crouch && prev.crouch;
+    cmd.crouchHeld = crouch;
     cmd.pronePressed = prone && !prev.prone;
     cmd.sprintHeld = sprint;
     cmd.sprintPressed = sprint && !prev.sprint;
@@ -251,6 +258,7 @@ export class Movement {
     } else {
       cmd.jump = false;
       cmd.crouchPressed = false;
+      cmd.crouchReleased = false;
       cmd.pronePressed = false;
       cmd.sprintPressed = false;
     }
@@ -294,7 +302,7 @@ export class Movement {
     const forwardIntent = rawInput > 1e-4 ? my / rawInput : 0;
 
     // ---- discrete decisions, in priority order --------------------------
-    this._updateStance(cmd, rawInput);
+    this._updateStance(cmd, rawInput, h);
     this._updateSprint(cmd, rawInput, forwardIntent);
     this._updateSlide(cmd, h, wish, wishLen);
     const jumped = this._updateJump(cmd);
@@ -363,19 +371,54 @@ export class Movement {
   /* stance                                                               */
   /* ==================================================================== */
 
-  _updateStance(cmd, rawInput) {
+  /**
+   * HYBRID CROUCH — the reason ducking used to be unreliable.
+   *
+   * A pure toggle is unreliable in the hand: you press Ctrl to slide, the slide
+   * ends, and you are still crouched without having asked to be. A pure hold is
+   * unreliable in the other direction: you cannot stay crouched behind cover
+   * while your hand does something else. CoD ships both on one key and so do we.
+   *
+   *   tap  (< MOVE.crouchHold seconds)  toggles the stance and keeps it
+   *   hold (>= that)                    crouches while held, restores on release
+   *
+   * The stance at the moment of the press is remembered, so a hold always
+   * returns you exactly where you were rather than to a guessed "stand".
+   */
+  _updateStance(cmd, rawInput, h) {
     const c = this.character;
+
+    // The hold clock runs even mid-slide: a slide entered with a held crouch
+    // has to know, when it ends, whether the key is still down.
+    if (cmd.crouchPressed) {
+      this._crouchHoldTime = 0;
+      this._crouchStanceOnPress = this.sliding ? 'stand' : this.stanceWant;
+    } else if (cmd.crouchHeld) {
+      this._crouchHoldTime += h;
+    }
+
     if (this.sliding) {
       this.stanceWant = 'crouch';
     } else {
       if (cmd.crouchPressed) {
         this.stanceWant = this.stanceWant === 'crouch' ? 'stand' : 'crouch';
       }
+      if (cmd.crouchReleased) {
+        if (this._crouchHoldTime >= MOVE.crouchHold) this.stanceWant = this._crouchStanceOnPress;
+        this._crouchHoldTime = 0;
+      }
+
       if (cmd.pronePressed) {
         this.stanceWant = this.stanceWant === 'prone' ? 'crouch' : 'prone';
       }
       // Sprinting always stands you up — CoD does not let you sprint crouched.
-      if (cmd.sprintHeld && rawInput > 0.5 && this.stanceWant !== 'stand' && cmd.moveY > 0.5) {
+      // Not while the crouch key is physically held, though: that is the player
+      // explicitly asking to stay down, and popping up under their hand is the
+      // single most common way a stance system feels broken.
+      if (
+        cmd.sprintHeld && !cmd.crouchHeld && rawInput > 0.5 &&
+        this.stanceWant !== 'stand' && cmd.moveY > 0.5
+      ) {
         this.stanceWant = 'stand';
       }
       if (cmd.jump && this.stanceWant !== 'stand') this.stanceWant = 'stand';
@@ -448,10 +491,21 @@ export class Movement {
 
     if (!this.sliding) {
       const fast = Math.hypot(v.x, v.z);
+      /**
+       * The entry gate is SPEED, not the sprint flag.
+       *
+       * Requiring `sprinting` made the slide much rarer than it looks on paper:
+       * sprint itself needs the stick within 56 degrees of dead ahead, so a
+       * diagonal sprint-strafe — the way people actually cross open ground —
+       * never sets the flag and the crouch key just crouched instead. Base walk
+       * is 4.57 m/s and the gate is 5.2, so nothing below a real run qualifies
+       * anyway; dropping the flag adds sprint-strafes, ramp runs and slide-hop
+       * chains without letting a walk turn into a slide.
+       */
       const canStart =
         cmd.crouchPressed &&
-        this.sprinting &&
         c.grounded &&
+        this.stance !== 'prone' &&
         fast >= MOVE.slide.minSpeedToStart &&
         this._slideCooldown <= 0 &&
         this._mantleCooldown <= 0;
@@ -463,18 +517,21 @@ export class Movement {
 
     // Slide-cancel: a jump out of a slide is the signature CoD movement tech.
     if (this._jumpBuffer > 0 && c.grounded && this._jumpCooldown <= 0) {
-      this._endSlide(true);
+      this._endSlide(true, cmd);
       return;
     }
     // Standing up mid-slide, or losing the floor, or bleeding out of speed.
+    // A crouch *release* also ends it, so a hold-to-slide reads the same way a
+    // hold-to-crouch does: let go and you are back on your feet.
     const sp = Math.hypot(v.x, v.z);
     if (
       cmd.crouchPressed ||
+      (cmd.crouchReleased && this._slideTime > MOVE.crouchHold) ||
       this._slideTime > MOVE.slide.duration ||
       sp < MOVE.slide.exitSpeed ||
       (!c.grounded && this.airTime > 0.14)
     ) {
-      this._endSlide(false);
+      this._endSlide(false, cmd);
     }
   }
 
@@ -507,7 +564,7 @@ export class Movement {
     this.slideStarted = true;
   }
 
-  _endSlide(intoJump) {
+  _endSlide(intoJump, cmd = this.cmd) {
     this.sliding = false;
     this._slideCooldown = MOVE.slide.cooldown;
     this._slideTime = 0;
@@ -528,7 +585,11 @@ export class Movement {
       }
       this._doJump();
     } else {
-      this.stanceWant = 'crouch';
+      // A slide entered by HOLDING crouch ends on your feet once the key is
+      // released; one entered with a tap leaves you crouched, which is what the
+      // toggle promised. Either way the stance you get is the one you asked for.
+      const heldEntry = this._crouchHoldTime >= MOVE.crouchHold;
+      this.stanceWant = heldEntry && !cmd.crouchHeld ? 'stand' : 'crouch';
     }
     this.slideEnded = true;
   }
@@ -658,6 +719,21 @@ export class Movement {
     if (rawInput < 0.02) rate = MOVE.stopDecel;
     else if (speed < cur * 0.92) rate = MOVE.groundDecel;
     else rate = MOVE.groundAccel;
+
+    /**
+     * Strafe authority. `lateral` is how much of the requested direction is
+     * across the current velocity rather than along it, so a straight A/D tap
+     * out of a forward run scores ~1 and a slight course correction scores ~0.
+     * Scaling the rate by it makes counter-strafing snap without touching
+     * straight-line acceleration, which is already effectively instant.
+     */
+    if (cur > 0.6 && (tx !== 0 || tz !== 0)) {
+      const tl = Math.hypot(tx, tz) || 1;
+      const along = (tx / tl) * (v.x / cur) + (tz / tl) * (v.z / cur);
+      const lateral = clamp01(1 - Math.max(0, along));
+      rate *= 1 + (MOVE.strafeAccelScale - 1) * lateral;
+    }
+
     // Rough ground (sand, dirt) responds a little more sluggishly.
     rate *= clamp(this.character.groundFriction + 0.08, 0.75, 1.05);
 

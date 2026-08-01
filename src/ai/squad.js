@@ -6,6 +6,13 @@
  * instead of all leaning out together, shares contact reports so one man
  * spotting you alerts the rest (after a believable call-out delay), rations
  * grenades, and allows only one flanker at a time.
+ *
+ * It also reports its own dead. A casualty is the loudest thing that happens in
+ * a firefight and it used to be the only thing the squad ignored — MEASURED on
+ * the garrison: agent 1 was shot dead 1.1 m from agent 3, and agents 2 and 3
+ * kept walking their patrol route with `lastKnownAge` still at infinity for the
+ * next four seconds. `reportDown()` is what turns a body hitting the floor into
+ * information the survivors act on: see Agent.squadmateDown().
  */
 
 import * as THREE from 'three';
@@ -26,6 +33,17 @@ export class Squad {
     this.hasContact = false;
     this.contactAge = Infinity;
     this._pending = [];
+
+    /* ---------------- casualties ---------------- */
+    /** how many of us are down, and where the last one fell */
+    this.casualties = 0;
+    this.lastCasualty = new THREE.Vector3();
+    this.casualtyAge = Infinity;
+    /** best guess at where the killing round came from */
+    this.threat = new THREE.Vector3();
+    this.hasThreat = false;
+    /** fraction of the original squad still standing, refreshed each frame */
+    this.strength = 1;
   }
 
   add(agent) {
@@ -45,6 +63,10 @@ export class Squad {
   update(dt) {
     this.grenadeCooldown -= dt;
     this.contactAge += dt;
+    this.casualtyAge += dt;
+    // Cached rather than a getter: _combat reads it every frame per man, and it
+    // can only change when somebody dies.
+    this.strength = this.members.length ? this.alive / this.members.length : 0;
     if (this.flanker && (!this.flanker.alive || this.flanker.state !== 'flank')) this.flanker = null;
 
     // contact sharing: whoever can see the player broadcasts, with a delay
@@ -75,6 +97,33 @@ export class Squad {
     if (this.peekTimer <= 0) {
       this.peekTimer = 1.1 + this.rng.float() * 1.2;
       this.peekHolders.clear();
+    }
+  }
+
+  /**
+   * One of ours is down. Called from Agent.die() while the body is still where
+   * it fell, so every survivor gets the position first-hand.
+   *
+   * @param victim  the man who just died
+   * @param threat  world point the killing round is estimated to have come
+   *                from, or null when there is nothing to go on
+   */
+  reportDown(victim, threat) {
+    this.casualties++;
+    this.lastCasualty.copy(victim.position);
+    this.casualtyAge = 0;
+    if (threat) {
+      this.threat.copy(threat);
+      this.hasThreat = true;
+    }
+    // whatever he was holding, he is not holding it any more
+    this.peekHolders.delete(victim.id);
+    if (this.flanker === victim) this.flanker = null;
+
+    this.strength = this.members.length ? this.alive / this.members.length : 0;
+    for (const m of this.members) {
+      if (m === victim || !m.alive) continue;
+      m.squadmateDown(this.lastCasualty, this.hasThreat ? this.threat : null, this.strength);
     }
   }
 

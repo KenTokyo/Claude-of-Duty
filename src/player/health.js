@@ -164,13 +164,16 @@ export class Health {
     const H = HEALTH;
 
     // ---- regeneration ---------------------------------------------------
+    // Out of contact, not merely un-hit: suppression from near misses holds the
+    // clock, so leaning out and being missed is not a rest period.
     const since = this.ctx.time.elapsed - this.lastDamageTime;
-    if (!this.dead && this.value < this.max && since > H.regenDelay) {
+    const inContact = this.suppression > H.regenSuppressionHold;
+    if (!this.dead && this.value < this.max && since > H.regenDelay && !inContact) {
       this.regenerating = true;
       // Ramp in so the recovery has a shape rather than a step.
       const ramp = clamp01((since - H.regenDelay) / H.regenRamp);
       this.value = Math.min(this.max, this.value + H.regenRate * ramp * dt);
-    } else if (this.value >= this.max) {
+    } else if (this.value >= this.max || inContact) {
       this.regenerating = false;
     }
 

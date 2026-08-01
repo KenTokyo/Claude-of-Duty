@@ -12,6 +12,7 @@ import { Minimap } from './minimap.js';
 import { WorldMarkers } from './markers.js';
 import { Prompt, Banner } from './prompts.js';
 import { PauseMenu } from './menu.js';
+import { DeathScreen } from './death.js';
 import { CombatDemo } from './demo.js';
 
 const MAX_BLIPS = 48;
@@ -92,6 +93,10 @@ export class UiSystem {
     this.prompt = new Prompt(this.chromeLayer);
     this.banner = new Banner(this.chromeLayer);
     this.menu = new PauseMenu(this.root, ctx);
+    this.death = new DeathScreen(this.root);
+    this.death.onRespawn = () => this.respawn();
+    /** Name of whatever landed the killing blow, for the death screen line. */
+    this._lastAttacker = null;
 
     this.health.onBeat = (i) => this.sfx('heartbeat', 0.35 + i * 0.5);
 
@@ -225,6 +230,15 @@ export class UiSystem {
       }
       this.hurt(amount, dx, dz);
     });
+
+    on('damage:dealt', (e) => {
+      // Remember who is shooting at US, so the death screen can name them.
+      if (this._isPlayerTarget(e?.target)) this._lastAttacker = e?.by?.name ?? e?.source?.name ?? 'ENEMY';
+    });
+
+    // The player system decides the round is over; we show it.
+    on('player:defeat', () => this.showDefeat());
+    on('player:respawn', () => this.death.hide());
 
     on('actor:death', (e) => {
       if (ctx.time.elapsed - this._lastKillAt < 0.3) return; // already credited
@@ -378,6 +392,41 @@ export class UiSystem {
     this.menu.close();
   }
 
+  /* ---------------------------------------------------------------- death -- */
+
+  /**
+   * Zero health: hide the HUD, release the pointer so the Redeploy button can
+   * be clicked, and put the death screen up. The pause menu must NOT open on
+   * that unlock — see the `deadLocked` guard in lateUpdate.
+   */
+  showDefeat() {
+    if (this.death.open) return;
+    this.menu.close();
+    this.state.health = 0;
+    this.killfeed.push({
+      attacker: this._lastAttacker ?? 'ENEMY',
+      victim: 'YOU',
+      attackerFriendly: false,
+    });
+    this.death.show({ killer: this._lastAttacker });
+    this.setHudVisible(false);
+    document.exitPointerLock?.();
+    this.sfx('player_death', 0.9);
+  }
+
+  /** Redeploy. Clicking the button is a user gesture, so the lock can return. */
+  respawn() {
+    const player = this.ctx.peek('player');
+    this.death.hide();
+    this.setHudVisible(true);
+    this._lastAttacker = null;
+    this.arcs.clear();
+    if (typeof player?.respawnFromDeath === 'function') player.respawnFromDeath();
+    else player?.respawn?.();
+    this.state.health = player?.maxHealth ?? 100;
+    this.ctx.input?.requestPointerLock?.();
+  }
+
   /* --------------------------------------------------------------- debug -- */
 
   /**
@@ -422,7 +471,13 @@ export class UiSystem {
       !ctx.input.frozen &&
       this._wasPointerLocked &&
       !pointerLocked &&
-      !this.menu.open
+      !this.menu.open &&
+      // A fullscreen transition drops pointer lock on its own and Input is
+      // already re-acquiring it. That is not the player asking to pause.
+      !ctx.input.relockPending &&
+      // Nor is dying: the death screen releases the pointer on purpose so its
+      // Redeploy button is clickable.
+      !this.death.open
     ) {
       // Browsers may reserve Escape while pointer-locked and emit only the
       // lock-loss event. Detect that single edge instead of retaining a stale
@@ -431,6 +486,9 @@ export class UiSystem {
     }
     this._wasPointerLocked = pointerLocked;
     this.menu.update(rawDt);
+    // Unscaled time: the redeploy countdown has to keep running even though the
+    // simulation may be paused underneath it.
+    this.death.update(rawDt);
 
     // ---- external state --------------------------------------------------
     // `simulate` means a scripted debug timeline owns the HUD numbers; letting
@@ -452,6 +510,7 @@ export class UiSystem {
 
     const ps = s.simulate ? null : this._playerState();
     const player = ctx.peek('player');
+    const wasRegen = s.regen;
     if (ps) {
       if (ps.health !== undefined) s.health = ps.health;
       if (ps.maxHealth !== undefined) s.maxHealth = ps.maxHealth;
@@ -465,6 +524,14 @@ export class UiSystem {
       if (ps.airborne !== undefined) s.airborne = !!ps.airborne;
     } else if (player && typeof player.health === 'number') {
       s.health = player.health;
+    }
+
+    // The "you are healing again" cue used to live only in the stub-simulation
+    // branch below, so with a real player system driving health it never fired.
+    // Take the rising edge wherever `s.regen` came from.
+    if (s.regen && !wasRegen) {
+      this.health.onRegenStart();
+      this.sfx('regen', 0.4);
     }
 
     // ---- movement-derived reticle bloom (works with any player system) ----
@@ -482,11 +549,7 @@ export class UiSystem {
     if (!ps && !s.simulate && s.health < s.maxHealth) {
       this._regenTimer += dt;
       if (this._regenTimer > 4.5) {
-        if (!s.regen) {
-          s.regen = true;
-          this.health.onRegenStart();
-          this.sfx('regen', 0.4);
-        }
+        s.regen = true; // the edge above turns this into the cue
         s.health = Math.min(s.maxHealth, s.health + dt * 24);
       }
     }
@@ -625,6 +688,7 @@ export class UiSystem {
     this.prompt.dispose();
     this.banner.dispose();
     this.menu.dispose();
+    this.death.dispose();
     this.root.remove();
     removeStyles();
   }

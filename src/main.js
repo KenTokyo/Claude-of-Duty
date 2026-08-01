@@ -15,6 +15,7 @@ import { AudioSystem } from './audio/index.js';
 
 import { installShotApi } from './dev/shots.js';
 import { prewarm } from './core/prewarm.js';
+import { enterFullscreen, fullscreenSupported } from './core/fullscreen.js';
 
 const QUALITY_NAMES = ['low', 'medium', 'high', 'ultra'];
 const QUALITY_TRANSITION_KEY = 'overwatch:quality-transition';
@@ -114,6 +115,7 @@ const startScreen = document.getElementById('start-screen');
 const bootLoading = document.getElementById('boot-loading');
 const startButton = document.getElementById('start-button');
 const startSelectionStatus = document.getElementById('start-selection-status');
+const startFullscreenToggle = document.getElementById('start-fullscreen');
 const startQualityButtons = [...document.querySelectorAll('[data-start-quality]')];
 const bootStatus = document.getElementById('boot-status');
 const bootActivity = document.getElementById('boot-activity');
@@ -299,6 +301,13 @@ async function waitForStartChoice() {
       cleanups.push(() => target.removeEventListener(type, handler));
     };
     const finish = () => {
+      // Fullscreen has to be requested from inside this click: it is the only
+      // user activation we will get before the game takes the keyboard, and
+      // without it the Keyboard Lock API is unavailable, which is what keeps
+      // Ctrl+W (crouch + strafe-left) from closing the tab.
+      if (startFullscreenToggle?.checked !== false && fullscreenSupported()) {
+        enterFullscreen(document.documentElement).catch(() => {});
+      }
       config.setQuality(selectedQuality);
       saveQualityPreference(selectedQuality);
       bootProfile = `Qualität: ${QUALITY_LABEL[config.quality] ?? config.quality} · WebGL 2`;

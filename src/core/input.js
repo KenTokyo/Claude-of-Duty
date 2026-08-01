@@ -6,15 +6,20 @@
  * the transition happened — read them in update(), not fixedUpdate().
  */
 
+import {
+  toggleFullscreen, enterFullscreen, exitFullscreen, isFullscreen,
+  onFullscreenChange, fullscreenSupported, keyboardLockSupported, keysLocked,
+} from './fullscreen.js';
+
 export const ACTIONS = {
   forward: ['KeyW', 'ArrowUp'],
   back: ['KeyS', 'ArrowDown'],
   left: ['KeyA', 'ArrowLeft'],
   right: ['KeyD', 'ArrowRight'],
   jump: ['Space'],
-  crouch: ['ControlLeft', 'KeyC'],
+  crouch: ['ControlLeft', 'ControlRight', 'KeyC'],
   prone: ['KeyZ'],
-  sprint: ['ShiftLeft'],
+  sprint: ['ShiftLeft', 'ShiftRight'],
   reload: ['KeyR'],
   use: ['KeyF'],
   melee: ['KeyV'],
@@ -26,14 +31,26 @@ export const ACTIONS = {
   pause: ['Escape'],
 };
 
+/** Codes that are a modifier in their own right — never a "modified shortcut". */
+const MODIFIER_CODES = new Set([
+  'ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight',
+  'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight',
+]);
+
+/** Ctrl is bound to crouch, so a held Ctrl is gameplay state, not a shortcut. */
+const CROUCH_MODIFIERS = new Set(['ControlLeft', 'ControlRight']);
+
 // Only keys actually consumed by gameplay may suppress a browser default.
-// F11, refresh/devtools shortcuts and keyboard navigation must stay native.
+// Refresh/devtools shortcuts and keyboard navigation must stay native.
 const GAMEPLAY_CODES = new Set([
   ...Object.values(ACTIONS).flat(),
   'KeyB',
   'KeyI',
   'Digit3',
 ]);
+
+/** Toggling fullscreen is handled here so it owns the trusted key gesture. */
+const FULLSCREEN_CODES = new Set(['F11']);
 
 export class Input {
   constructor(canvas, config) {
@@ -58,6 +75,16 @@ export class Input {
     this.onPause = null;
     /** Set true by capture mode so scripted shots aren't fought by real input. */
     this.frozen = false;
+
+    /**
+     * Entering or leaving fullscreen drops pointer lock in most browsers. That
+     * looks exactly like "the player pressed Escape" to the pause menu, so the
+     * menu would pop open every time somebody hit F11. While this is true we
+     * are re-acquiring the lock ourselves and the unlock must be ignored.
+     */
+    this.relockPending = false;
+    this.fullscreen = false;
+    this._offFullscreen = null;
 
     this.gamepadIndex = null;
     this.stick = { moveX: 0, moveY: 0, lookX: 0, lookY: 0 };
@@ -85,6 +112,8 @@ export class Input {
     addEventListener('blur', this._bound.blur);
     document.addEventListener('pointerlockchange', this._bound.lockchange);
     this.canvas.addEventListener('contextmenu', this._bound.contextmenu);
+    this.fullscreen = isFullscreen();
+    this._offFullscreen = onFullscreenChange((on) => this._onFullscreenChange(on));
   }
 
   detach() {
@@ -97,6 +126,54 @@ export class Input {
     removeEventListener('blur', this._bound.blur);
     document.removeEventListener('pointerlockchange', this._bound.lockchange);
     this.canvas.removeEventListener('contextmenu', this._bound.contextmenu);
+    this._offFullscreen?.();
+    this._offFullscreen = null;
+  }
+
+  /* ------------------------------------------------------------ fullscreen -- */
+
+  /** What the pause menu draws, and what `keys` diagnostics report. */
+  get fullscreenState() {
+    return {
+      supported: fullscreenSupported(),
+      active: this.fullscreen,
+      keyboardLockSupported: keyboardLockSupported(),
+      keyboardLocked: keysLocked(),
+    };
+  }
+
+  /**
+   * Toggle fullscreen on the whole document, then restore pointer lock.
+   *
+   * Must run inside a user gesture. Callers that are already inside one (a
+   * click handler, our own keydown) can just call this; anything else will get
+   * a rejected request and a `false` result rather than an exception.
+   */
+  toggleFullscreen() {
+    return this.setFullscreen(!isFullscreen());
+  }
+
+  setFullscreen(on) {
+    if (!fullscreenSupported()) return Promise.resolve(false);
+    const wasLocked = this.pointerLocked;
+    this.relockPending = wasLocked;
+    const done = on ? enterFullscreen(document.documentElement) : exitFullscreen();
+    return Promise.resolve(done)
+      .then((ok) => {
+        // The lock is dropped by the fullscreen transition itself. Re-request it
+        // on the far side; the transition still counts as the user gesture.
+        if (wasLocked) return this.requestPointerLock().then(() => ok);
+        return ok;
+      })
+      .catch(() => false)
+      .finally(() => { this.relockPending = false; });
+  }
+
+  _onFullscreenChange(on) {
+    this.fullscreen = on;
+    // A fullscreen exit the user triggered (Escape, browser chrome) should not
+    // leave a half-held key behind if focus moved with it.
+    if (!on) this._onBlur();
   }
 
   requestPointerLock() {
@@ -132,12 +209,42 @@ export class Input {
       }
     }
 
+    // Fullscreen is toggled from inside the trusted keydown, because
+    // requestFullscreen() needs the user activation this event carries.
+    // F11 alone, or Alt+Enter — the two conventions PC players already know.
+    if (FULLSCREEN_CODES.has(e.code) || (e.altKey && e.code === 'Enter')) {
+      e.preventDefault();
+      this.toggleFullscreen();
+      return;
+    }
+
     if (!GAMEPLAY_CODES.has(e.code)) return;
     const fromControl = !!e.target?.closest?.('button, input, select, textarea, a[href], [contenteditable="true"]');
+
+    /**
+     * Which modifier flags mean "this is a browser shortcut, keep your hands
+     * off it"?
+     *
+     * Ctrl is the subtle one. It is BOUND TO CROUCH, so every crouch-walk sends
+     * `ctrlKey: true` on the W/A/S/D that follows. Treating that as a shortcut
+     * was doing two bad things at once: the movement key never reached the game
+     * (crouch-strafe simply stopped the player) and the browser default was
+     * never cancelled, so Ctrl+D bookmarked the page, Ctrl+S offered to save it
+     * and Ctrl+R reloaded the match. While the pointer is locked the player is
+     * unambiguously playing, so Ctrl belongs to us — we take the key and cancel
+     * the default. The moment the pointer unlocks it is the browser's again.
+     */
+    const ctrlIsCrouch =
+      this.pointerLocked &&
+      (this._crouchModifierHeld() || CROUCH_MODIFIERS.has(e.code));
+    // Same argument for Alt: while locked, Alt+ArrowLeft is a strafe, not
+    // "navigate back". Alt+Enter never reaches here — it toggled fullscreen
+    // above. Meta stays the operating system's: Cmd+Q and Cmd+Tab are not ours
+    // to cancel and pretending otherwise only loses the key.
     const modifiedShortcut =
-      (e.metaKey && !e.code.startsWith('Meta')) ||
-      (e.ctrlKey && !e.code.startsWith('Control')) ||
-      (e.altKey && !e.code.startsWith('Alt'));
+      (e.metaKey && !MODIFIER_CODES.has(e.code)) ||
+      (e.altKey && !MODIFIER_CODES.has(e.code) && !this.pointerLocked) ||
+      (e.ctrlKey && !MODIFIER_CODES.has(e.code) && !ctrlIsCrouch);
 
     // While unlocked, keyboard input belongs to the pause menu/browser. In
     // particular, Tab and Space must continue to operate focused controls.
@@ -147,8 +254,19 @@ export class Input {
     this._pendingDown.add(e.code);
   }
 
+  /** True while a Ctrl key we bound to crouch is physically down. */
+  _crouchModifierHeld() {
+    for (const c of CROUCH_MODIFIERS) {
+      if (this.down.has(c) || this._pendingDown.has(c)) return true;
+    }
+    return false;
+  }
+
   _onKeyUp(e) {
     if (!this.enabled || !GAMEPLAY_CODES.has(e.code)) return;
+    // Never gate a key-up on modifiers or pointer lock. A key that goes down in
+    // the game and up while the browser happens to hold focus elsewhere would
+    // otherwise stay held for ever, and the player runs into a wall.
     this._pendingUp.add(e.code);
   }
 

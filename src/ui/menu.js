@@ -58,6 +58,28 @@ export class PauseMenu {
       return String(v | 0);
     });
 
+    // ---- fullscreen ------------------------------------------------------
+    // Reachable three ways on purpose: here, F11, and Alt+Enter. The button
+    // matters most — it is the only one that works when the player has already
+    // lost the pointer and does not know which key to press.
+    const fsRow = this._row('Fullscreen');
+    const fsSeg = el('div', 'ow-seg', fsRow);
+    this.fsBtns = [];
+    for (const [label, val] of [
+      ['off', false],
+      ['on', true],
+    ]) {
+      const b = el('button', null, fsSeg, label);
+      b.type = 'button';
+      // A click IS a user activation, so requestFullscreen() is allowed here.
+      b.addEventListener('click', () => {
+        Promise.resolve(this.ctx.input?.setFullscreen?.(val)).then(() => this.syncFromConfig());
+        this.ctx.events.emit('ui:setting', { key: 'fullscreen', value: val });
+      });
+      this.fsBtns.push([b, val]);
+    }
+    this.fsHint = el('div', 'val', fsRow, '');
+
     // ---- invert look -----------------------------------------------------
     const invRow = this._row('Invert Look');
     const invSeg = el('div', 'ow-seg', invRow);
@@ -89,7 +111,9 @@ export class PauseMenu {
       this.ctx.config.invertY = false;
       this.setQuality('ultra');
     });
-    this._defaultHint = 'ESC RESUME · WASD MOVE · SHIFT SPRINT · R RELOAD · F USE';
+    this._defaultHint =
+      'ESC RESUME · WASD MOVE · SHIFT SPRINT · CTRL/C CROUCH (HOLD OR TAP) · ' +
+      'SPRINT+CTRL SLIDE · F11 FULLSCREEN · R RELOAD · F USE';
     this.hint = el('div', 'hint', inner, this._defaultHint);
 
     this.open = false;
@@ -168,6 +192,24 @@ export class PauseMenu {
       this.qBtns[i].disabled = this._qualityPending !== null;
     }
     for (const [b, v] of this.invBtns) b.classList.toggle('on', !!cfg.invertY === v);
+
+    const fs = this.ctx.input?.fullscreenState;
+    if (fs) {
+      for (const [b, v] of this.fsBtns) {
+        b.classList.toggle('on', fs.active === v);
+        b.disabled = !fs.supported;
+      }
+      // Say plainly whether the reserved shortcuts are actually neutralised —
+      // "on" alone does not tell the player whether Ctrl+W still closes the tab.
+      setText(
+        this.fsHint,
+        !fs.supported ? 'not available'
+          : fs.keyboardLocked ? 'game keys captured'
+            : fs.active ? 'browser keeps ctrl+w/t/tab'
+              : fs.keyboardLockSupported ? 'f11 · alt+enter' : 'f11'
+      );
+    }
+
     this.sens?.set((cfg.sensitivity ?? 0.0022) / 0.0022);
     this.fov?.set(cfg.fov ?? 80);
   }

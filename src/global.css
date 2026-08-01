@@ -279,6 +279,35 @@ body {
   text-transform: uppercase;
 }
 
+/* Fullscreen opt-in on the start screen. It is a gameplay control, not a
+   comfort setting: fullscreen is what lets the Keyboard Lock API stop Ctrl+W
+   from closing the tab mid-firefight (see src/core/fullscreen.js). */
+.start-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 6px 0 7px;
+  color: #cfc9bb;
+  font: 650 10px/1.4 ui-monospace, "Cascadia Mono", "SFMono-Regular", monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.start-toggle input {
+  flex: 0 0 auto;
+  margin: 1px 0 0;
+  accent-color: var(--boot-accent);
+  cursor: pointer;
+}
+
+.start-toggle em {
+  color: var(--boot-faint);
+  font-style: normal;
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+
 #boot.is-reloading .boot-card {
   width: min(560px, calc(100vw - 36px));
 }

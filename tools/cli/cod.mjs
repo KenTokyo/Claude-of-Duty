@@ -33,6 +33,21 @@
  *
  * IMAGES
  *   shot        --q=ultra --out=FILE.png [--w=640 --h=400] [--at=90]
+ *   imgdiff     --a=FILE.png --b=FILE.png [--tol=0]  decoded pixel comparison
+ *               (never compare the files themselves — Deflate makes two
+ *                byte-identical frames differ by a couple of bytes)
+ *
+ * GAMEPLAY — the real Input handlers, a scripted timeline, no browser
+ *   play        [--scenario=crouch,slide,strafe,slidestrafe,death,regen,ai,
+ *                          aideath,aisquad,aiflank,aihit,aigrenade,airetreat,
+ *                          aimove,keys]
+ *               drives keys through Input._onKeyDown and asserts on what the
+ *               game did: stance, slide entry, death at 0 HP, regen timing,
+ *               enemy travel, how a squad reacts to losing a man, whether a
+ *               flanker keeps moving, what a hit man does about it, whether he
+ *               ever gets another grenade, whether the last man of a broken
+ *               squad stops running away, whether a man who is walking actually
+ *               arrives, and which game keys reach Chrome.
  *
  * Global: --q=<low|medium|high|ultra>, --frames=N, --at=<frame>, --verbose,
  *         and --qset=key=value,key2=value2 to override quality settings for one
@@ -62,7 +77,7 @@
  *   |z| > 3 as a finding and anything below it as noise. Structural counters
  *   need no timing at all and are always sound.
  */
-import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { boot, run, stats } from './harness.mjs';
@@ -3304,7 +3319,119 @@ async function cmdCrtaps() {
   }, null, 2));
 }
 
+/**
+ * GAMEPLAY, not pixels: does the crouch key crouch, does a slide start, does
+ * the player die at 0 HP, does health come back, do the enemies move, and does
+ * any game key still reach Chrome. Scenarios live in playtests.mjs; every one
+ * drives the real Input handlers so a key the game drops shows up as dropped.
+ */
+async function cmdPlay() {
+  const { SCENARIOS } = await import('./playtests.mjs');
+  const wanted = String(argv.scenario ?? argv.only ?? 'all');
+  const names = wanted === 'all' ? Object.keys(SCENARIOS) : wanted.split(',');
+  const unknown = names.filter((n) => !SCENARIOS[n]);
+  if (unknown.length) {
+    console.error(`unknown scenario(s): ${unknown.join(', ')}`);
+    console.error(`available: ${Object.keys(SCENARIOS).join(', ')}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  const results = [];
+  for (const n of names) {
+    const restore = quiet();
+    let r;
+    try {
+      r = await SCENARIOS[n]();
+    } catch (err) {
+      r = { name: n, pass: false, error: String(err?.stack ?? err).split('\n').slice(0, 4).join(' | ') };
+    }
+    restore();
+    results.push(r);
+    if (!argv.json) {
+      const tag = r.pass ? 'PASS' : 'FAIL';
+      const detail = { ...r };
+      delete detail.name; delete detail.pass; delete detail.rows;
+      console.log(`${tag}  ${r.name}`);
+      for (const [k, v] of Object.entries(detail)) {
+        console.log(`      ${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
+      }
+    }
+  }
+
+  const failed = results.filter((r) => !r.pass);
+  if (argv.json) console.log(JSON.stringify({ results, failed: failed.length }, null, 2));
+  else console.log(`\n${results.length - failed.length}/${results.length} scenarios pass` +
+    (failed.length ? ` — failing: ${failed.map((r) => r.name).join(', ')}` : ''));
+  if (failed.length) process.exitCode = 1;
+}
+
+/**
+ * Pixel-compare two PNGs written by `shot`.
+ *
+ * This exists because the obvious comparison is wrong: two byte-identical frames
+ * routinely produce PNG files of different length, because Deflate's choice of
+ * match is not a function of the pixels alone. A size or hash comparison on the
+ * file therefore reports a change that is not there. Decode both, compare
+ * channels, and report where.
+ *
+ * MEASURED on the pair this was written for (`/tmp/cod-check5.png` against
+ * `/tmp/cod-shot-ultra-90.png`): the files differ by 2 bytes, the pixels by 1 of
+ * 256000 — one silhouette edge of an agent landing on a different subpixel.
+ *
+ *   node tools/cli/cod.mjs imgdiff --a=/tmp/x.png --b=/tmp/y.png [--tol=0] [--top=8]
+ *
+ * Exit code is 0 when no pixel exceeds --tol, 1 otherwise, so it can gate.
+ */
+async function cmdImgdiff() {
+  const { PNG } = await import('pngjs');
+  const tol = Number(argv.tol ?? 0);
+  const top = Number(argv.top ?? 8);
+  const pa = String(argv.a ?? ''); const pb = String(argv.b ?? '');
+  if (!pa || !pb) { console.error('usage: imgdiff --a=<png> --b=<png> [--tol=N] [--top=N]'); process.exitCode = 2; return; }
+
+  const a = PNG.sync.read(readFileSync(pa));
+  const b = PNG.sync.read(readFileSync(pb));
+  if (a.width !== b.width || a.height !== b.height) {
+    console.log(JSON.stringify({ a: pa, b: pb, sizeA: `${a.width}x${a.height}`, sizeB: `${b.width}x${b.height}`, comparable: false }, null, 2));
+    process.exitCode = 1;
+    return;
+  }
+
+  // Worst pixels first, but only keep --top of them: a genuinely changed frame
+  // differs in tens of thousands of pixels and the list is not the interesting part.
+  const worst = [];
+  let differing = 0, over = 0, maxDelta = 0, sum = 0;
+  for (let i = 0, p = 0; p < a.data.length; i++, p += 4) {
+    let d = 0;
+    for (let c = 0; c < 4; c++) { const x = Math.abs(a.data[p + c] - b.data[p + c]); if (x > d) d = x; }
+    if (d === 0) continue;
+    differing++; sum += d;
+    if (d > maxDelta) maxDelta = d;
+    if (d > tol) over++;
+    if (worst.length < top || d > worst[worst.length - 1].delta) {
+      worst.push({ x: i % a.width, y: (i / a.width) | 0, delta: d });
+      worst.sort((u, v) => v.delta - u.delta);
+      if (worst.length > top) worst.length = top;
+    }
+  }
+
+  const pixels = a.width * a.height;
+  console.log(JSON.stringify({
+    a: pa, b: pb, size: `${a.width}x${a.height}`, pixels,
+    fileBytes: [statSync(pa).size, statSync(pb).size],
+    differingPixels: differing,
+    differingPercent: +(100 * differing / pixels).toFixed(4),
+    aboveTolerance: over, tolerance: tol,
+    maxChannelDelta: maxDelta,
+    meanDeltaOverDiffering: differing ? +(sum / differing).toFixed(2) : 0,
+    worst,
+  }, null, 2));
+  if (over) process.exitCode = 1;
+}
+
 const COMMANDS = {
+  play: cmdPlay, imgdiff: cmdImgdiff,
   probe: cmdProbe, shaders: cmdShaders, fingerprint: cmdFingerprint, diff: cmdDiff,
   leak: cmdLeak, presets: cmdPresets, systems: cmdSystems, passes: cmdPasses,
   shot: cmdShot, overdraw: cmdOverdraw, drawlist: cmdDrawlist, targets: cmdTargets,

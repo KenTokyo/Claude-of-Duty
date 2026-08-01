@@ -60,6 +60,11 @@
  *   p.setControlEnabled(bool)     shot harness / cutscenes
  *   p.teleport(eyePosition, rotationEulerOrYaw)
  *   p.respawn(index)
+ *   p.respawnFromDeath(index)     undo a defeat: clears the camera collapse and
+ *                                 the death roll, re-arms the hitbox, restores
+ *                                 control, then respawns. This is what the death
+ *                                 screen's Redeploy button calls — plain
+ *                                 `respawn()` would leave the view on the floor
  *   p.debugState(name)            'sprint'|'slide'|'crouch'|'hurt'|'critical'|
  *                                 'air'|'reset'
  *
@@ -72,7 +77,11 @@
  *   player:heartbeat  { strength, fraction }                                  *
  *   player:mantle     { kind, height }                                        *
  *   player:jump       { position }                                            *
- *   player:death      { position }                                            *
+ *   player:death      { position }             health crossed zero
+ *   player:defeat     { position, health, elapsed }   the round is over: control
+ *                     off, hitbox down, camera collapsing. `ui` draws the death
+ *                     screen off this, not off player:death
+ *   player:respawn    { position }             back on your feet
  *   (*) not in the canonical table in ARCHITECTURE.md — additive, optional, and
  *   safe to ignore. The canonical `player:state` payload carries `health` too so
  *   a listener that only knows the documented four fields still gets everything.
@@ -85,6 +94,11 @@ import { Health } from './health.js';
 import { LowHealthPass } from './lowhealth.js';
 import { STANCE, MOVE, CAMERA, HEALTH, FOOTSTEP, JUMP_SPEED } from './tuning.js';
 import { clamp, clamp01, lerp, approach, DEG } from './springs.js';
+
+/** Death collapse: seconds to fall, final eye height, roll at rest. */
+const DEATH_FALL = 1.05;
+const DEATH_EYE = 0.3;
+const DEATH_ROLL = 22 * DEG;
 
 export class PlayerSystem {
   static id = 'player';
@@ -104,6 +118,9 @@ export class PlayerSystem {
     this._adsExternal = false;
     this._adsExternalAge = 0;
     this.adsRequested = false;
+    /** null while alive; seconds since the killing hit once dead. */
+    this.deathTime = null;
+    this._deathRoll = 1;
 
     this._lookFrame = -1;
     this._prevYaw = 0;
@@ -188,6 +205,8 @@ export class PlayerSystem {
     on('damage:dealt', (e) => this._onDamageDealt(e));
     on('explosion', (e) => this._onExplosion(e));
     on('bullet:impact', (e) => this._onBulletImpact(e));
+    // Health only *reports* the kill; ending the round is this system's job.
+    on('player:death', () => this._onDeath());
 
     console.info(
       `[player] spawn ${spawn.feet.x.toFixed(1)}, ${spawn.feet.y.toFixed(2)}, ` +
@@ -280,9 +299,13 @@ export class PlayerSystem {
     this._updateAds(dt);
     this._drainMovementEvents();
     this.health.update(dt);
+    this._updateDeath(dt);
 
     this.rig.update(dt, this.movement, this.health);
-    if (this.controlEnabled) this.rig.applyTo(ctx.camera);
+    // Control is off while dead, but the death collapse is exactly the case
+    // where the rig still has to reach the camera — otherwise the view freezes
+    // upright and the kill reads as a hang rather than as a death.
+    if (this.controlEnabled || this.deathTime !== null) this.rig.applyTo(ctx.camera);
     else this.rig.forward.set(0, 0, -1).applyQuaternion(ctx.camera.quaternion);
 
     this.lowHealthPass?.sync(this.health);
@@ -455,6 +478,69 @@ export class PlayerSystem {
   }
 
   /* ==================================================================== */
+  /* death                                                                */
+  /* ==================================================================== */
+
+  /**
+   * The round ends the instant health crosses zero.
+   *
+   * `Health` used to emit `player:death` into a void: nothing listened, so a
+   * dead player kept sprinting, kept firing and kept taking damage indicators
+   * for a body that no longer had any health to lose. Everything that has to
+   * stop, stops here, in one place, exactly once.
+   *
+   * The camera is deliberately NOT frozen — it falls. A hard cut reads as a bug
+   * report; a collapse reads as a death, and it is the cheapest possible version
+   * of the thing CoD spends an animation on.
+   */
+  _onDeath() {
+    if (this.deathTime !== null && this.deathTime !== undefined) return; // already dying
+    this.deathTime = 0;
+    this.setControlEnabled(false);
+    const m = this.movement;
+    m.velocity.set(0, 0, 0);
+    m.sprinting = false;
+    m.tacticalSprint = false;
+    m.sliding = false;
+    m.leanInput = 0;
+    this.adsAmount = 0;
+    this._adsExternal = false;
+    if (this.hitbox) this.hitbox.enabled = false;
+    this.rig.addTrauma(0.5);
+    // Roll the view over as the body goes down; direction follows the last hit.
+    this._deathRoll = (this.health.indicators.find((i) => i.active)?.angle ?? 0) < 0 ? -1 : 1;
+    this.ctx.events.emit('player:defeat', {
+      position: this.position,
+      health: 0,
+      elapsed: this.ctx.time.elapsed,
+    });
+  }
+
+  /** Camera collapse: eye sinks to the floor, view rolls, over DEATH_FALL sec. */
+  _updateDeath(dt) {
+    if (this.deathTime === null || this.deathTime === undefined) return;
+    this.deathTime += dt;
+    const t = clamp01(this.deathTime / DEATH_FALL);
+    // easeOutCubic: most of the drop happens straight away, then it settles.
+    const e = 1 - (1 - t) ** 3;
+    const stand = STANCE.stand.eye;
+    this.rig.eyeOffset = lerp(stand, DEATH_EYE, e);
+    this.rig.deathRoll = this._deathRoll * DEATH_ROLL * e;
+  }
+
+  /** Back on your feet: full health, spawn point, controls returned. */
+  respawnFromDeath(index = 0) {
+    this.deathTime = null;
+    this._deathRoll = 0;
+    this.rig.eyeOffset = null;
+    this.rig.deathRoll = 0;
+    this.respawn(index);
+    if (this.hitbox) this.hitbox.enabled = true;
+    this.setControlEnabled(true);
+    this.ctx.events.emit('player:respawn', { position: this.position });
+  }
+
+  /* ==================================================================== */
   /* public API                                                           */
   /* ==================================================================== */
 
@@ -624,6 +710,12 @@ export class PlayerSystem {
       this.movement.tacticalSprint = false;
       this.movement.sliding = false;
       this.movement.cancelMantle();
+      // `step()` stops running entirely while control is off, so these would
+      // otherwise keep reporting whatever the last live frame saw — a dead or
+      // paused player with a fully bloomed reticle and a `sprint` HUD state.
+      this.movement.speed = 0;
+      this.movement.horizontalSpeed = 0;
+      this.movement.state = this.movement.grounded ? 'stand' : 'fall';
       this.adsAmount = 0;
       this._adsExternal = false;
     } else {

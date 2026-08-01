@@ -64,7 +64,11 @@
           <button id="start-button" type="button">Spiel starten</button>
           <div>
             <p id="start-selection-status" aria-live="polite">Niedrig ausgewählt · für schwächere Geräte geeignet</p>
-            <p>Das Grafikprofil kann später im Pausemenü geändert werden.</p>
+            <label class="start-toggle" for="start-fullscreen">
+              <input id="start-fullscreen" type="checkbox" checked />
+              <span>Im Vollbild starten <em>· verhindert, dass Spieltasten Browser-Aktionen auslösen</em></span>
+            </label>
+            <p>Grafikprofil und Vollbild (F11 · Alt+Enter) lassen sich jederzeit im Pausemenü ändern.</p>
           </div>
         </div>
 

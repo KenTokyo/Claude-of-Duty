@@ -683,6 +683,42 @@ const CSS = `
   letter-spacing:.2em; color: var(--ink-3);
 }
 
+/* ================================================================= death */
+/* Sits above the HUD and below nothing: at zero health this IS the screen. */
+.ow-death {
+  position:absolute; inset:0; opacity:0; will-change:opacity;
+  display:grid; place-items:center;
+}
+.ow-death-wash {
+  position:absolute; inset:0;
+  background:
+    radial-gradient(120% 90% at 50% 55%, rgba(92,8,8,0) 18%, rgba(74,6,6,.62) 62%, rgba(28,2,2,.94) 100%),
+    linear-gradient(rgba(12,3,3,.72), rgba(12,3,3,.86));
+  backdrop-filter: blur(calc(3px * var(--k))) saturate(.28) brightness(.62);
+}
+.ow-death-inner {
+  position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+  width: calc(520px * var(--k)); text-align:center;
+}
+.ow-death-t {
+  font-family: var(--fd); font-weight:700;
+  font-size: calc(54px * var(--k)); letter-spacing:.26em;
+  color:#f3e7e4; text-shadow:0 calc(3px * var(--k)) calc(16px * var(--k)) rgba(0,0,0,.9);
+}
+.ow-death-s {
+  margin-top: calc(var(--u) * 2);
+  font-size: calc(11px * var(--k)); letter-spacing:.3em; color:#e0a09a;
+}
+.ow-death-rule {
+  margin: calc(var(--u) * 4) auto calc(var(--u) * 3); height:1px; width:70%;
+  background: linear-gradient(to right, rgba(255,255,255,0), rgba(226,120,110,.6), rgba(255,255,255,0));
+}
+.ow-death-count {
+  font-family: var(--fm); font-size: calc(11px * var(--k));
+  letter-spacing:.14em; color: var(--ink-3);
+}
+.ow-death-btn { margin-top: calc(var(--u) * 4); }
+
 /* ============================================================== fadeouts */
 .ow-hidden { display:none !important; }
 `;

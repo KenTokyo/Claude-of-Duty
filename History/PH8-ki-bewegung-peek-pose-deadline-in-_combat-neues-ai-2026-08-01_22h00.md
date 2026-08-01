@@ -1,0 +1,95 @@
+# PH8 - KI-Bewegung - Peek-Pose-Deadline in _combat, neues ai-move-Gate, ehrli...
+
+> 2026-08-01T20:00:44.619Z · Grund: Zeitlimit erreicht
+
+Vor der Übergabe noch die letzte offene Aufgabe (Aufräumen) erledigen und den Endzustand absichern.
+
+Endzustand gesichert: 15/15 Gates grün, Build 2.99 s, glslcheck 0 findings, `tools/cli/` enthält keine `_probe-*.mjs` mehr.
+
+---
+
+## 1. Mission in 2 Sätzen
+
+Punkt 7 der Notiz `Notes/spielfluss-verbessern-behebe-verbessere-notes.md` („Gegner sollen sich bewegen statt stillzustehen") wurde abgeschlossen: der zweite Bewegungs-Keil (Peek-Pose in `_combat`) ist behoben, und der gesamte Fund „Agenten laufen auf der Stelle" ist erstmals **gegatet** statt nur in Wegwerf-Proben belegt. Qualitätskontrolle läuft ausschließlich browserlos über `node tools/cli/cod.mjs` — **niemals einen Browser starten** (crasht den Laptop des Users).
+
+## 2. Was wurde bereits erledigt
+
+**A. Die Suite gegen den `progress`-Fix der Vorschicht gelaufen — alles grün, keine Referenz musste zurückgedreht werden.** 14/14 vor meinen Änderungen, `pnpm build` 2.23 s, `glslcheck --q=ultra` 0 findings. Verschoben, aber innerhalb der Ansprüche: `ai-flank` `flankAttempts 11→9`, `coverQueries 76→81`; `ai-retreat` `breakOffsTaken 3→1`, `worstRetreatSharePct 13.4→6.7`. Punkt 3A der letzten Übergabe ist damit erledigt.
+
+**B. Der Peek-Keil ist vermessen, bevor er behoben wurde.** Über 40 s Plain-Firefight: **1044 von 2513 Frames, die nirgendwohin gingen, waren diese eine Verzweigung — 41.5 %**, und der schlimmste Stillstand überhaupt (4.58 s) war einer. Beleg an Agent 3: `dStance` konstant **0.611 m über vier Sekunden und VIER Peek-Zyklen**, `progress` 0.000, während `peekTimer` munter weiterlief. `peekOffset` liefert also deterministisch dieselbe Pose, auf der der Mann nicht stehen kann.
+
+**C. Fix in `src/ai/agent.js` `_combat` (~Z. 780) — der Schlurf hat jetzt eine Frist.** Neu: `this.stanceTimer` im Konstruktor neben `stancePos`; Bedingung `if (shuffle > 0.12 && this.stanceTimer < 0.8)`, sonst `desiredSpeed = 0` und `hasMoveTarget = false`. Zurückgesetzt an **vier** Stellen: bei Ankunft (`if (shuffle <= 0.12) this.stanceTimer = 0;`) und an den drei Zuweisungen von `stancePos` (neue Deckung ~Z. 684, Peek-Umschalter ~Z. 755). **Die Ankunfts-Rückgabe ist nicht optional** — ohne sie schleppt ein Mann einen verbrauchten Timer in die nächste Pose und geht nie wieder. Wirkung: längster Schlurf-Stillstand **4.58 s → 0.98 s**. Kein RNG-Draw, keine Allokation.
+
+**D. Ein Messfehler entlarvt, der mich fast eine Fehldiagnose gekostet hätte.** Nach dem Fix las die alte Sonde im zerschlagenen Fall **schlechter** (20.7 % → 26.6 %). Ursache: das Kriterium `speed > 0.5` zählt den **Auslauf** mit — wer aufgibt, setzt `desiredSpeed = 0`, und `speed` braucht ~0.5 s zum Abklingen. Klassifiziert man die Frames nach Auftraggeber (`shuffle` / `easeOut` / `separation` / `travel`), ist die ehrliche Zahl — *er folgt einer Route und kommt nicht voran* — **19.6 % plain und 16.7 % gutted, längste Strähne 1.42 s statt 4.58 s**.
+
+**E. Neues Gate `ai-move` (`--scenario=aimove`, Abschnitt 13 in `tools/cli/playtests.mjs`), 40 s.** Vier Ansprüche im `pass`: (1) sie reisen überhaupt (`travelFrames >= 2000`); (2) `longestTravelStallS < 2.5`; (3) `longestShuffleStallS < 1.5`; (4) `worstGround >= 10` als Wächter. Ein Travel-Frame ist `desiredSpeed > 0.2 && hasMoveTarget && !pathPending` — nicht `speed > 0`, aus den drei in D genannten Gründen. Der Schlurf wird an der Quelle erkannt: `_setPath1(dest, 0.1)` ist die Schlurf-Anordnung und nur sie (`_goTo` übergibt 0.45).
+
+**F. Vier gemessene Negativkontrollen, jede Wache besitzt genau EINEN Anspruch:**
+
+| Build | stallPct | travelStall | shuffleStall | worstGround |
+|---|---|---|---|---|
+| Auslieferung | 20.0 | **1.40 s** | **0.98 s** | 35.8 m |
+| A: Watchdog wieder auf `speed` | 26.7 | **7.35 s** | 0.98 s | 32.7 m |
+| B: keine Stance-Frist | 19.5 | 1.40 s | **6.53 s** | 53.9 m |
+| A+B (Vorschicht-Zustand) | 20.9 | **6.20 s** | **6.53 s** | 38.4 m |
+
+Die Spalten kreuzen sich nicht: A bewegt `shuffleStall` nicht, B bewegt `travelStall` nicht.
+
+**G. `travelStallPct` ist bewusst NICHT im `pass`** — die Tabelle ist der Grund: 20.0 gesund gegen 19.5 / 20.9 / 26.7 kaputt, **Build B liegt unter der Auslieferung**. Kein Schwellwert trennt das. Der Watchdog verhindert kein Verkeilen, er beendet es und gibt dieselbe Route zurück; aus einem 6-s-Stillstand werden vier 1.4-s-Stillstände und die Framezahl bleibt stehen. Die Zahl wird gemeldet, mit dem Grund daneben.
+
+**H. Das Loch im bestehenden `ai-flank`-Gate ist geschlossen.** `longestStandStillS` maß `a.speed < 0.2` und war in **beide** Richtungen falsch: ein mit 4.4 m/s auf der Stelle sprintender Mann galt als bewegt (4.58 s unsichtbar), und mein Peek-Fix trieb die Zahl von 4.87 auf **6.95 gegen eine Schwelle von 8** — ein besserer Build wäre fast rot geworden, weil Männer jetzt *stehen bleiben* statt zu zappeln. Jetzt `longestTravelStallS` auf `progress`-Basis: **1.40 s gesund, 7.35 s mit Kontrolle A**, Schwelle 2.5.
+
+**I. `scenarioAi` ist kein schwaches Gate mehr (Punkt 3D der letzten Übergabe).** `travelled()` summiert Pfadlänge — zwei Männer, die sich in einer Tür schubsen, knacken die alten 2 m in sechs Sekunden. Neu: `reachedM` (weiteste je erreichte Entfernung vom Spawn) und `straightness` (netto/Pfad). Gemessen: alle sechs zwischen **6.67 m und 27.47 m**, `straightness` 0.40–0.94. Ansprüche: `wentSomewhere >= 60 %` bei 4 m (Wächter, keine Kontrolle bewegt ihn — das steht so am Code) und `longestTravelStallS < 2.5` (**1.40 gesund, 3.57 mit Kontrolle A**; kürzer als die 7.35 über 40 s, was genau der Grund für die längere `ai-move`-Laufzeit ist).
+
+**J. Zwei Fixversuche für die Rest-20 % gebaut, gemessen und BEIDE verworfen — das ist ein Ergebnis, kein Ausfall.** Diagnose zuerst: auf **3051 Stillstandsframes zeigte der Steer auf 3021 direkt auf den Wegpunkt**, der Controller meldete auf 2530 Kontakt, ein Kamerad war auf nur 299 im Separationsradius — es ist **Geometrie, kein Kameraden-Deadlock**; der Mann drückt frontal gegen eine Wand, die das Nav-Grid für offen hält, und Collide-and-Slide lässt bei senkrechtem Auftreffen fast keine Tangentialbewegung übrig. Versuch 1 (unerreichbaren Zwischen-Wegpunkt überspringen statt Route wegzuwerfen): **schlechter**, 1.4 s → 7.35 s und 20.0 % → 24.6 % — das Aufgeben der Route IST die Rettung, wer auf ihr bleibt, verliert die Notbremse. **Das neue Gate hat meine eigene Regression sofort gefangen.** Versuch 2 (Deckungsanspruch beim Stillstand freigeben, mit Präzedenz aus der `_goTo`-Ablehnung nebenan): **wirkungslos**, 20.7 %. Beide sauber zurückgedreht und per `includes()` verifiziert.
+
+**K. Bildkontrolle: kein gerendertes Pixel bewegt.** `shot --q=ultra --at=90` gegen `/tmp/cod-shot-ultra-90.png`: **1 Pixel von 256000** (454,209, Δ 58) — dieselbe Silhouettenkante wie in den letzten beiden Schichten. Das Bild selbst angesehen, Straßenszene plausibel.
+
+**L. Endzustand: 15/15 Gates grün, `pnpm build` 2.99 s, `glslcheck --q=ultra` 0 findings.** Header-Doku in `cod.mjs` nachgezogen (vollständige Szenarienliste inkl. `airetreat`/`aimove`/`slidestrafe`, Beschreibungssatz erweitert). **Aufgeräumt: `tools/cli/` enthält keine `_probe-*.mjs` mehr** — alle fünf gelöscht (`_probe-peek`, `-spot`, `-wedge`, `-retreat`, `-pace`). Punkt 3E der letzten Übergabe erledigt.
+
+## 3. Was ist offen / als Nächstes zu tun (priorisiert)
+
+**A. HÖCHSTE PRIORITÄT — die Rest-Stillstandsrate ist diagnostiziert, aber die wahrscheinlichste Erklärung ist NICHT bestätigt.** Ich war mitten in dieser Messung, als die Zeit ablief. **Annahme, ungeprüft:** die 20 % messen zum großen Teil gar kein Verkeilen, sondern den **Geschwindigkeits-Auslauf**. `this.speed += (targetSpeed - this.speed) * min(1, dt * 7)` braucht ~0.14 s auf 63 %, `progress` hinkt einen Frame nach — **jeder Start eines Marsches** liegt also 5–9 Frames unter der 25-%-Schwelle, ohne dass irgendetwas falsch ist. Überschlag: ~20 Starts pro Mann über 40 s × 6 Mann × ~7 Frames ≈ 840 der 1420 Stillstandsframes. Das erklärt zwanglos, warum **kein** Fix die Zahl bewegt. Die Probe dafür war fertig geschrieben und ist mit dem Aufräumen gelöscht — sie teilte die Stillstandsframes nach dem Alter des Marschbefehls (`< 8` Frames / `8–30` / `> 30`) und meldete zusätzlich die Rate nur für „gesetzte" Frames (`> 30`). **Wenn sich das bestätigt, ist die richtige Konsequenz keine Codeänderung, sondern eine ehrlichere Metrik:** `travelStallPct` nur über Frames mit Befehlsalter > 30 rechnen, dann trennt sie vielleicht doch und kann in den `pass` — vorher aber die vier Builds aus der Tabelle in 2F erneut damit messen.
+
+**B. Der eigentliche Bewegungsfehler ist NICHT behoben, nur begrenzt.** Der Mann verkeilt sich weiterhin genauso oft; er hängt nur noch 1.4 s statt 6.2 s fest, und A* liefert danach dieselbe Route (bis zu **fünf Anfragen auf dasselbe Ziel** in 40 s). Zwei naheliegende Wege sind in 2J **gemessen ausgeschlossen** — nicht wiederholen. Was noch nicht versucht wurde: beim Stillstand einen **Seitwärtsschritt** erzwingen, also `_steer` eine Tangentialkomponente geben (Seite deterministisch über `id % 2`, wie es die Separations-Logik in `_move` schon macht), statt weiter frontal zu drücken. Das passt zur Diagnose aus 2J. `src/physics/character.js` ist korrekt und gehört **nicht** uns — Fix muss in `src/ai/` liegen.
+
+**C. `minSize = 10` in `operatingRegion` und der Boden `cell * 2.5` in `findPath`** sind weiterhin aus der Verteilung **dieses** Levels gewählt und auf anderen Seeds ungeprüft (**Annahme** unverändert seit drei Schichten).
+
+**D. Nichts committen ohne ausdrückliche Aufforderung. Niemals `git stash`.** Im Baum liegt fremde uncommittete Arbeit (`index.html`, `src/core/input.js`, `src/main.js`, `src/ui/*`, `src/global.css`, `src/weapons/index.js`, `src/player/*`, …). Zu **dieser** Arbeit gehören genau drei Dateien: `src/ai/agent.js`, `tools/cli/playtests.mjs`, `tools/cli/cod.mjs`. `ARCHITECTURE.md` bleibt unverändert — keine neuen Events. `shared-docs/projects/claude-of-duty/` anzulegen ist weiterhin nicht möglich (Submodule nicht ausgecheckt, `git submodule update --init` wäre ein unbeauftragter Netzwerk-Fetch).
+
+## 4. Risiken & Edge Cases
+
+- **KEIN BROWSER.** Jedes Skript direkt unter `tools/*.mjs` startet Chromium. Erlaubt sind nur `node tools/cli/cod.mjs …` und eigene Proben **unter `tools/cli/`**, die `harness.mjs` + `play.mjs` importieren. Eine Probe unter `/tmp` findet `./harness.mjs` nicht.
+- **Sandbox:** `grep`/`rg` liefern **leere** Ergebnisse → stattdessen `node -e` mit `fs.readFileSync` und `split('\n').forEach`. `timeout` existiert nicht.
+- **`quiet()` in eigenen Proben fängt die `[render]`-Logs NICHT.** Ausgabe durch einen `node -e`-Filter pipen, der ab dem ersten `{` schneidet — sonst geht das JSON im Rauschen unter.
+- **Nicht auf `speed` messen, niemals.** `speed` ist die *Absicht*. Genau daran sind die alte Stall-Wache und `scenarioFlank`s Statuen-Zähler gescheitert, in beide Richtungen (siehe 2H). `progress` ist der zurückgelegte Boden und die einzige ehrliche Grundlage.
+- **`speed > 0.5` als „will sich bewegen" zählt den Auslauf mit** und hat mir eine Scheinregression von 20.7 % → 26.6 % gemeldet (2D). Wer eine Bewegungszahl bildet, filtert auf `desiredSpeed > 0.2 && hasMoveTarget && !pathPending`.
+- **`this.stanceTimer` muss bei ANKUNFT zurückgesetzt werden, nicht nur an den drei `stancePos`-Zuweisungen.** Sonst erbt die nächste Pose ein verbrauchtes Budget und der Mann schlurft nie wieder.
+- **`this.progress` misst über einen ganzen Frame und muss ganz oben in `_move` bleiben.** Rechnet man es um die Controller-Integration herum, liest ein Vault (den `_drive` per `lerpVectors` über 0.8 s fährt) als Stillstand und die Stall-Wache reißt dem Mann mitten im Sprung das Ziel weg.
+- **Die Gate-Laufzeit ist Teil der Behauptung.** `ai-move` braucht 40 s: über 20 s liest derselbe kaputte Build nur 3.57 s statt 7.35 s. `ai-retreat` braucht 60 s (Begründung steht dort im Kopfkommentar). Wer kürzt, entwertet die Kontrolle, ohne dass etwas rot wird.
+- **Der zerschlagene Fall ist NICHT der härtere.** `ai-move` läuft bewusst als Plain-Firefight ohne Tote: zwei Männer machen kein Gedränge und lesen 16.7 % gegen 19.6 %.
+- **Beide Böden in der Stall-Bedingung werden gebraucht.** Nur relativ verliert den Mann, dessen `speed` nie anläuft; nur absolut verliert den Keil bei 4.4 angeforderten m/s.
+- **Determinismus:** Weder der Stance-Fix noch der `progress`-Fix ziehen einen RNG-Draw — aber geändertes *Verhalten* ändert, wie oft später gewürfelt wird. Deshalb nach jeder Verhaltensänderung die volle Suite, nicht nur das betroffene Szenario.
+- **Geteilte CoverMap:** `ai.cover` ist global über alle Squads; bei Test-Flakiness zuerst hier suchen.
+- **PNG-Vergleich niemals über die Dateigröße** — dafür ist `cod.mjs imgdiff` da. Bei `--tol=0` ist Exit 1 schon bei einem einzigen Silhouetten-Pixel.
+
+## 5. Wichtige Dateien & warum
+
+- `src/ai/agent.js` — **das Hauptergebnis dieser Schicht.** `stanceTimer` im Konstruktor (~Z. 256); die Schlurf-Frist in `_combat` (~Z. 780) mit dem MEASURED-Absatz; die drei `stanceTimer = 0` an den `stancePos`-Zuweisungen (~Z. 685, ~757); die Stall-Wache in `_move` (~Z. 1117) unverändert aus der Vorschicht. **Der Seitwärtsschritt aus 3B gehört ebenfalls in diese Wache.**
+- `tools/cli/playtests.mjs` — `scenarioMove` (Abschnitt 13, `ai-move`) mit der Vier-Build-Tabelle direkt an der `pass`-Bedingung und der ausformulierten Begründung, warum `travelStallPct` nicht mitasserted wird; `scenarioAi` (Abschnitt 6) neu mit `reachedM`/`straightness`; `scenarioFlank` Anspruch 5 (~Z. 770) jetzt auf `progress`. **Neue Behauptungen gehören hierher — und jede mit einer Negativkontrolle, sonst ist sie Prosa.**
+- `tools/cli/cod.mjs` — `cmdImgdiff` über der `COMMANDS`-Map (kein Wegwerfstück, bleibt), Header-Doku mit der vollständigen Szenarienliste.
+- `tools/cli/play.mjs` — `play(engine, rec, { frames, timeline, onFrame, trackAi })`, `onFrame` läuft **nach** `engine.step`; bequemster Hebel für neue Messungen. `aiSample()` enthält **kein** `progress`/`desiredSpeed` — wer die braucht, nimmt `onFrame` und liest direkt vom Agenten (so machen es `scenarioMove` und `scenarioAi`).
+- `AGENTS.md` + `ARCHITECTURE.md` — Pflichtlektüre: eigenes Verzeichnis, keine Fremdimporte, keine neuen Dependencies, keine Allokation pro Frame, kein `Math.random()`, im Loop arbeiten, keine Rückfragen.
+
+## 6. Übergabe-Startprompt für die nächste KI
+
+Arbeite im Repo `/Users/kentoky/Documents/React Projects/Claude-of-Duty` autonom weiter, im Loop, ohne Rückfragen. **Starte niemals einen Browser** — weder Playwright noch headless, das crasht den Laptop des Users. Messen und Screenshots ausschließlich über `node tools/cli/cod.mjs`; eigene Proben dürfen unter `tools/cli/` liegen und `harness.mjs`/`play.mjs` importieren, müssen aber vor Schichtende wieder gelöscht werden. In dieser Sandbox liefern `grep`/`rg` leere Ergebnisse — nutze `node -e` mit `fs.readFileSync`; und `quiet()` in Proben unterdrückt die `[render]`-Logs nicht, filtere die JSON-Ausgabe ab dem ersten `{`. Kein `git stash`, im Baum liegt fremde uncommittete Arbeit, und committe nichts ohne ausdrückliche Aufforderung. Lies zuerst `AGENTS.md` und `ARCHITECTURE.md`.
+
+Stand: **15/15 Gates grün, Build 2.99 s, glslcheck 0 findings, `tools/cli/` frei von `_probe-*.mjs`.** Der Peek-Pose-Keil in `_combat` ist behoben — ein Mann schlurfte 0.6 m zu einer Pose, auf der er nicht stehen kann, und ordnete denselben Schlurf jeden Frame neu an; mit `stanceTimer` und einer 0.8-s-Frist fällt der längste solche Stillstand von 4.58 s auf 0.98 s. Der ganze Fund „Agenten laufen auf der Stelle" ist jetzt gegatet: neues `ai-move` (`--scenario=aimove`, 40 s) mit vier Ansprüchen und einer Tabelle aus vier gemessenen Negativkontroll-Builds, bei denen sich keine zwei Spalten kreuzen. Zwei kaputte Metriken sind ersetzt: `scenarioFlank`s Statuen-Zähler maß `speed` und war in beide Richtungen falsch (mein Fix trieb ihn von 4.87 auf 6.95 gegen Schwelle 8 — ein besserer Build wäre fast rot geworden), und `scenarioAi` maß Pfadlänge statt Verschiebung und hätte zwei sich in einer Tür schubsende Männer durchgewinkt.
+
+Deine Aufgaben in dieser Reihenfolge:
+
+1. **Die offene Messung aus 3A zu Ende bringen — hier war ich mitten drin.** Vermutung, ungeprüft: die verbleibenden 20 % Stillstandsrate messen überwiegend den Geschwindigkeits-Auslauf (`speed += (target - speed) * min(1, dt*7)`, ~0.14 s auf 63 %, `progress` einen Frame hinterher) und nicht Verkeilen — Überschlag ~840 der 1420 Frames. Schreib eine Probe unter `tools/cli/`, die die Stillstandsframes nach dem Alter des Marschbefehls aufteilt (`< 8` Frames / `8–30` / `> 30`) und die Rate nur für Frames mit Alter `> 30` meldet. Bestätigt sich das, ist die Konsequenz **keine Codeänderung**, sondern die ehrlichere Metrik: `travelStallPct` nur über gesetzte Frames rechnen und dann prüfen, ob sie die vier Builds aus der Tabelle in `scenarioMove` trennt — wenn ja, in den `pass` aufnehmen, wenn nein, den Grund danebenschreiben wie jetzt.
+2. **Erst danach den Restfehler angehen.** Der Mann verkeilt sich unverändert oft, er hängt nur kürzer fest. **Zwei Wege sind gemessen ausgeschlossen, nicht wiederholen:** unerreichbare Zwischen-Wegpunkte überspringen (macht es schlechter, 1.4 s → 7.35 s, weil das Aufgeben der Route die eigentliche Rettung ist) und den Deckungsanspruch beim Stillstand freigeben (wirkungslos, 20.7 %). Die Diagnose steht: auf 3051 Stillstandsframes zeigte der Steer auf 3021 direkt auf den Wegpunkt und ein Kamerad war nur auf 299 im Separationsradius — es ist Geometrie, der Mann drückt frontal gegen eine Wand, die das Nav-Grid für offen hält. Ungetestet und passend: beim Stillstand eine Tangentialkomponente in `_steer` geben, Seite deterministisch über `id % 2` wie in der Separations-Logik. `src/physics/character.js` ist korrekt und gehört uns nicht — der Fix muss in `src/ai/` liegen.
+3. **Jede neue Behauptung gehört in `tools/cli/playtests.mjs` und braucht eine Negativkontrolle** (Fix temporär zurückdrehen, Gate muss fallen, sauber restaurieren — vorher `cp` als Backup, danach mit `includes()` prüfen, und zwar auch auf *Abwesenheit* der Experimentreste). Drei Fallen, alle bezahlt: manche Ketten brauchen zwei gleichzeitige Reverts; die **Laufzeit ist Teil der Behauptung** (`ai-move` liest über 20 s nur 3.57 s statt 7.35 s); und wenn sich eine Zahl über keine Kontrolle von einem kaputten Build trennen lässt, gieß sie **nicht** ins `pass`, sondern melde sie und schreib den Grund daneben — das ist in `scenarioFlank`, `scenarioRetreat`, `scenarioAi` und `scenarioMove` je einmal so gemacht und begründet.
+4. **Vor Schichtende:** volle Suite (`node tools/cli/cod.mjs play`), `pnpm build`, `glslcheck --q=ultra`, ein `shot --q=ultra --at=90` gegen `/tmp/cod-shot-ultra-90.png` per `imgdiff` (Erwartung: 1 Pixel von 256000 an 454,209 — dieselbe Silhouettenkante seit drei Schichten), und `tools/cli/` von allen `_probe-*.mjs` befreien.

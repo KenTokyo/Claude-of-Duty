@@ -35,6 +35,9 @@ export class CameraRig {
     // ---- smoothed stance -------------------------------------------------
     this.eye = 1.66;
     this.crouchBlend = 0;
+    /** Death collapse, driven by `player`. null = the stance owns eye height. */
+    this.eyeOffset = null;
+    this.deathRoll = 0;
 
     // ---- bob -------------------------------------------------------------
     this.bobPhase = 0;
@@ -92,6 +95,8 @@ export class CameraRig {
 
   reset(eye) {
     this.eye = eye;
+    this.eyeOffset = null;
+    this.deathRoll = 0;
     this.bobPhase = 0;
     this.bobWeight = 0;
     this.dip.reset(0);
@@ -177,7 +182,10 @@ export class CameraRig {
     const ads = clamp01(m.adsAmount);
 
     // ---- stance / eye height --------------------------------------------
-    const targetEye = m.eyeHeight + (m.sliding ? -0.1 : 0);
+    // `eyeOffset` is the death collapse: the player system drives it straight
+    // down to the floor over a second. It overrides the stance entirely, which
+    // is the point — a corpse has no stance.
+    const targetEye = this.eyeOffset ?? (m.eyeHeight + (m.sliding ? -0.1 : 0));
     const growing = targetEye > this.eye;
     const tau = m.stance === 'prone' || this.eye < 0.75
       ? MOVE.stanceTau.prone
@@ -290,7 +298,7 @@ export class CameraRig {
     const roll =
       this.strafeRoll + this.turnRoll + this.slideRoll + this.airRoll +
       this.bobRoll + this.recoilRoll.value + this.kickRoll.value + shakeRoll +
-      mantleRoll - m.leanAmount * MOVE.lean.roll;
+      mantleRoll - m.leanAmount * MOVE.lean.roll + this.deathRoll;
 
     this.rotation.set(pitch, yaw, roll);
 
