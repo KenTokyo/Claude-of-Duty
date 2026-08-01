@@ -1,0 +1,16 @@
+{
+  "version": 4,
+  "favorites": [
+    "Notes/optimize-game-loop-current-notes.md"
+  ],
+  "excludedFolders": [],
+  "sort": "modified",
+  "timeFilter": 2,
+  "fileLimit": 1000,
+  "folderFileLimit": 4,
+  "recentHighlight": 2,
+  "cleanupMaxAgeDays": 7,
+  "fontSize": 10,
+  "panelWidth": 300,
+  "updatedAt": "2026-08-01T00:45:18.594Z"
+}

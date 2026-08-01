@@ -18,13 +18,20 @@ import * as THREE from 'three';
 
 // RawShaderMaterial: three prepends nothing, so every attribute and the
 // precision qualifier are declared by hand.
+// uExposure is 1x1, so its reciprocal is one number for the whole draw. Read it
+// per vertex and hand it down `flat` -- three fetches instead of one per pixel,
+// and `flat` means the fragment stage sees the provoking vertex's bits rather
+// than an interpolation of three identical values.
 const VERT = /* glsl */ `
 precision highp float;
 in vec3 position;
 in vec2 uv;
+uniform sampler2D uExposure;
 out vec2 vUv;
+flat out float vInvExposure;
 void main() {
   vUv = uv;
+  vInvExposure = 1.0 / max(1e-3, texture(uExposure, vec2(0.5)).r);
   gl_Position = vec4(position.xy, 0.0, 1.0);
 }
 `;
@@ -36,8 +43,8 @@ uniform sampler2D uTex;
 /** x amount, y pulse, z hitFlash, w critical */
 uniform vec4 uState;
 uniform vec2 uAspect;
-/** 1x1, .r = the exposure scalar the composite will apply after us. */
-uniform sampler2D uExposure;
+/** 1 / the exposure scalar the composite will apply after us, from VERT. */
+flat in float vInvExposure;
 out vec4 fragColor;
 
 void main() {
@@ -77,15 +84,14 @@ void main() {
   // already black. This is a viewer-side overlay, not light in the scene, so it
   // is authored display-referred and divided by the exposure the composite is
   // about to apply — otherwise it vanishes at noon and blinds you at night.
-  float invExp = 1.0 / max(1e-3, texture(uExposure, vec2(0.5)).r);
-  c += vec3(0.115, 0.008, 0.005) * k * invExp;
+  c += vec3(0.115, 0.008, 0.005) * k * vInvExposure;
 
   // ---- hit flash ---------------------------------------------------------
   if (flash > 0.001) {
     float ring = 0.3 + 0.7 * smoothstep(0.05, 0.95, r);
     float f = clamp(flash * ring, 0.0, 1.0);
     c *= mix(vec3(1.0), vec3(1.3, 0.4, 0.34), f);
-    c += vec3(0.16, 0.012, 0.008) * f * invExp;
+    c += vec3(0.16, 0.012, 0.008) * f * vInvExposure;
   }
 
   fragColor = vec4(c, 1.0);

@@ -22,7 +22,7 @@ import { csmShaderChunk } from './csm.js';
  * patched material means a single write per frame updates all of them.
  */
 
-const PATCH_VERSION = 9;
+const PATCH_VERSION = 11;
 
 /** Max coarse interior volumes the indirect gate can hold (see OW_ROOMS). */
 export const MAX_ROOMS = 10;
@@ -36,6 +36,8 @@ export class MaterialPatcher {
 
     this.uniforms = {
       ...csmUniforms,
+      // See POINT_SKIP_PARS / withPointLightSkip. x = 1 ships the early-out.
+      owLightSkip: { value: new THREE.Vector2(1, 0) },
       owAoTex: { value: null },
       owContactTex: { value: null },
       owSsrTex: { value: null },
@@ -96,7 +98,9 @@ export class MaterialPatcher {
 
     const uniforms = this.uniforms;
     const simple = this.simple;
-    const parsChunk = simple ? this.chunk : this.chunk + EXTRA_PARS;
+    // The point-light early-out applies to both paths, so its uniform has to be
+    // declared in both — `EXTRA_PARS` is the full path only.
+    const parsChunk = POINT_SKIP_PARS + (simple ? this.chunk : this.chunk + EXTRA_PARS);
     const prevHook = material.onBeforeCompile;
     const prevKey = material.customProgramCacheKey;
     const key = this.key;
@@ -127,11 +131,18 @@ export class MaterialPatcher {
         // the direct light is what every shipping renderer uses to close that
         // gap; at 0.35 it costs 2-3% on an open surface and a third of the key
         // in a crevice.
-        directLight.color *= mix( 1.0, owSampleAO(), owAoStrength.x * 0.35 );`;
-      const dirBegin = THREE.ShaderChunk.lights_fragment_begin.replace(
-        'getDirectionalLightInfo( directionalLight, directLight );',
-        lightInjection
-      );
+        directLight.color *= mix( 1.0, owAoCached, owAoStrength.x * 0.35 );`;
+      // One AO fetch per fragment, hoisted to function scope. The micro-shadow
+      // above sits INSIDE the unrolled directional-light loop and the indirect
+      // block below is a second call site, so `owSampleAO()` was sampling the
+      // same texel at the same UV two or more times per pixel in the frame's
+      // hottest shader.
+      const dirBegin =
+        (simple ? '' : 'float owAoCached = owSampleAO();\n') +
+        withPointLightSkip(THREE.ShaderChunk.lights_fragment_begin).replace(
+          'getDirectionalLightInfo( directionalLight, directLight );',
+          lightInjection
+        );
       shader.fragmentShader = shader.fragmentShader.replace(
         '#include <lights_fragment_begin>',
         dirBegin
@@ -144,7 +155,7 @@ export class MaterialPatcher {
         `#include <lights_fragment_maps>
         #if defined( RE_IndirectDiffuse )
         {
-          float owAo = owSampleAO();
+          float owAo = owAoCached;
           if ( owAo < 1.0 ) {
             vec3 owBounce = owMultiBounce( owAo, diffuseColor.rgb );
             irradiance *= owBounce;
@@ -236,6 +247,69 @@ function makeVec4Array(n) {
   const a = new Array(n);
   for (let i = 0; i < n; i++) a[i] = new THREE.Vector4(0, 0, 0, 0);
   return a;
+}
+
+const POINT_SKIP_PARS = /* glsl */ `
+// x: 1 = allow the point-light early-out below, 0 = force every slot through the
+// full BRDF. Only ever 0 for the pointskip-off A/B row in tools/ab.mjs; it is a
+// uniform rather than a #define so the two halves of that pair measure the same
+// program instead of a recompile.
+uniform vec2 owLightSkip;
+`;
+
+/**
+ * Skip the BRDF for point lights that contribute exactly nothing.
+ *
+ * three computes `directLight.visible = ( light.color != vec3( 0.0 ) )` in
+ * `getPointLightInfo` and then, in the physical path, NEVER READS IT: the
+ * unrolled loop in `lights_fragment_begin` runs a full GGX + Lambert + shadow
+ * lookup for all NUM_POINT_LIGHTS slots on every fragment in the frame. Both
+ * ways a slot can be empty are exact, not approximate:
+ *
+ *   - Ballast. The padding lights world/index.js uses to hold the permutation
+ *     key still are colour 0x000000 at intensity 0, so `light.color` is a float
+ *     zero for every fragment. MEASURED at 4.6 ms of a 63 ms ultra frame.
+ *   - Range. `getDistanceAttenuation` multiplies by
+ *     `saturate( 1.0 - pow4( d / cutoffDistance ) )`, which is exactly 0.0 at
+ *     and beyond the cutoff. The world's practicals are 12 bulbs with a 13 m
+ *     range and 5 lamps with 22 m, so on the overwhelming majority of pixels
+ *     most live slots are already contributing a hard zero.
+ *
+ * Skipping is bit-exact, not an approximation: `RE_Direct_Physical` forms
+ * `irradiance = dotNL * directLight.color` and accumulates `irradiance * BRDF`,
+ * so a zero colour adds +0.0 to accumulators that start at vec3( 0.0 ). The
+ * guard is hoisted ABOVE the shadow block on purpose — multiplying a zero
+ * colour by a shadow factor is still zero, so the cube lookup is dead too.
+ *
+ * The condition is uniform across the whole draw for ballast slots and coherent
+ * per tile for range, which is the case GPUs actually skip.
+ */
+function withPointLightSkip(chunk) {
+  const start = chunk.indexOf('#if ( NUM_POINT_LIGHTS > 0 )');
+  const end = chunk.indexOf('#if ( NUM_SPOT_LIGHTS > 0 )');
+  // `RE_Direct(...)` is textually identical in the directional, point and spot
+  // loops, so the rewrite has to be confined to the point-light slice.
+  const A = 'getPointLightInfo( pointLight, geometryPosition, directLight );';
+  const B = 'RE_Direct( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );';
+  if (start < 0 || end <= start) return warnUnpatched(chunk, 'point-light section not found');
+  const body = chunk.slice(start, end);
+  if (!body.includes(A) || !body.includes(B)) return warnUnpatched(chunk, 'loop anchors moved');
+  // The inner `}` is safe inside `#pragma unroll_loop_start/end`: three's
+  // unroll regex closes on `}` followed only by whitespace and the end pragma,
+  // and this one is followed by the loop's own brace.
+  return (
+    chunk.slice(0, start) +
+    body
+      .replace(A, A + '\n\t\tif ( directLight.visible || owLightSkip.x < 0.5 ) {')
+      .replace(B, B + '\n\t\t}') +
+    chunk.slice(end)
+  );
+}
+
+function warnUnpatched(chunk, why) {
+  console.warn(`[materialpatch] point-light early-out disabled: ${why}. ` +
+    'three.js changed lights_fragment_begin; re-check the anchors.');
+  return chunk;
 }
 
 const EXTRA_PARS = /* glsl */ `

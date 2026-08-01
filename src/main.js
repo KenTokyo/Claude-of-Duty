@@ -18,6 +18,25 @@ import { prewarm } from './core/prewarm.js';
 
 const QUALITY_NAMES = ['low', 'medium', 'high', 'ultra'];
 const QUALITY_TRANSITION_KEY = 'overwatch:quality-transition';
+const QUALITY_PREFERENCE_KEY = 'overwatch:quality-preference';
+
+function readQualityPreference() {
+  try {
+    const value = localStorage.getItem(QUALITY_PREFERENCE_KEY);
+    return QUALITY_NAMES.includes(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveQualityPreference(value) {
+  if (!QUALITY_NAMES.includes(value)) return;
+  try {
+    localStorage.setItem(QUALITY_PREFERENCE_KEY, value);
+  } catch {
+    // Private browsing and embedded contexts may disable storage.
+  }
+}
 
 function consumeQualityTransition() {
   try {
@@ -39,6 +58,8 @@ function consumeQualityTransition() {
 
 const params = new URLSearchParams(location.search);
 const capture = params.get('capture') === '1';
+const requestedQuality = params.get('q');
+const explicitQuality = QUALITY_NAMES.includes(requestedQuality) ? requestedQuality : null;
 // Deterministic shutter for the pixel gate: the engine does not schedule its own
 // frames, the driver advances exactly N of them through window.__PUMP__. Opt-in,
 // because tools that measure real frame pacing (tools/perf.mjs) need the loop to
@@ -57,7 +78,7 @@ const prewarmMode =
 
 const storedQualityTransition = consumeQualityTransition();
 const qualityTransition =
-  !capture && storedQualityTransition?.quality === params.get('q')
+  !capture && storedQualityTransition?.quality === explicitQuality
     ? storedQualityTransition
     : null;
 const restoredSettings = {};
@@ -71,10 +92,17 @@ if (typeof qualityTransition?.settings?.invertY === 'boolean') {
   restoredSettings.invertY = qualityTransition.settings.invertY;
 }
 
-// Preserve the established ultra capture baseline while normal play uses the
-// safe production default from config.js. Every quality remains URL-selectable.
+// Preserve the established ultra capture baseline. Normal play preselects the
+// remembered profile, falling back to the safe production default from config.js.
+const preferredQuality = capture ? null : readQualityPreference();
 const config = createConfig({
-  ...(params.has('q') ? { quality: params.get('q') } : capture ? { quality: 'ultra' } : {}),
+  ...(explicitQuality
+    ? { quality: explicitQuality }
+    : capture
+      ? { quality: 'ultra' }
+      : preferredQuality
+        ? { quality: preferredQuality }
+        : {}),
   ...restoredSettings,
   deterministic: capture,
   prewarm: prewarmMode,
@@ -82,6 +110,11 @@ const config = createConfig({
 
 const canvas = document.getElementById('game');
 const boot = document.getElementById('boot');
+const startScreen = document.getElementById('start-screen');
+const bootLoading = document.getElementById('boot-loading');
+const startButton = document.getElementById('start-button');
+const startSelectionStatus = document.getElementById('start-selection-status');
+const startQualityButtons = [...document.querySelectorAll('[data-start-quality]')];
 const bootStatus = document.getElementById('boot-status');
 const bootActivity = document.getElementById('boot-activity');
 const bootPercent = document.getElementById('boot-percent');
@@ -119,7 +152,13 @@ const QUALITY_LABEL = {
   high: 'Hoch',
   ultra: 'Ultra',
 };
-const bootProfile = `Qualität: ${QUALITY_LABEL[config.quality] ?? config.quality} · WebGL 2`;
+const QUALITY_START_STATUS = {
+  low: 'Niedrig ausgewählt · für schwächere Geräte geeignet',
+  medium: 'Mittel ausgewählt · ausgewogene Darstellung',
+  high: 'Hoch ausgewählt · leistungsstarke GPU empfohlen',
+  ultra: 'Ultra ausgewählt · maximale GPU-Leistung erforderlich',
+};
+let bootProfile = `Qualität: ${QUALITY_LABEL[config.quality] ?? config.quality} · WebGL 2`;
 const bootStepElements = new Map();
 let activeBootStepId = null;
 let bootProgressValue = 0.02;
@@ -208,6 +247,88 @@ function setBoot(text, progress = bootProgressValue, detail = bootProfile, activ
   }
 }
 
+function revealBootProgress() {
+  if (!boot) return;
+  boot.classList.remove('is-awaiting-start');
+  boot.setAttribute('role', 'status');
+  boot.removeAttribute('aria-modal');
+  boot.setAttribute('aria-labelledby', 'boot-status');
+  boot.setAttribute('aria-busy', 'true');
+  startScreen?.setAttribute('aria-hidden', 'true');
+  bootLoading?.setAttribute('aria-hidden', 'false');
+}
+
+async function waitForStartChoice() {
+  const shouldWait = !capture && !explicitQuality && !qualityTransition;
+  if (!shouldWait || !boot || !startScreen || !startButton || startQualityButtons.length === 0) return;
+
+  let selectedQuality = config.quality;
+  const syncSelection = () => {
+    for (const button of startQualityButtons) {
+      const selected = button.dataset.startQuality === selectedQuality;
+      button.classList.toggle('is-selected', selected);
+      button.setAttribute('aria-checked', String(selected));
+      button.tabIndex = selected ? 0 : -1;
+    }
+    if (startSelectionStatus) {
+      startSelectionStatus.textContent = QUALITY_START_STATUS[selectedQuality] ?? `${selectedQuality} ausgewählt`;
+    }
+  };
+  const selectQuality = (name, focus = false) => {
+    if (!QUALITY_NAMES.includes(name)) return;
+    selectedQuality = name;
+    syncSelection();
+    if (focus) {
+      startQualityButtons.find((button) => button.dataset.startQuality === name)?.focus({ preventScroll: true });
+    }
+  };
+
+  boot.classList.add('is-awaiting-start');
+  boot.setAttribute('role', 'dialog');
+  boot.setAttribute('aria-modal', 'true');
+  boot.setAttribute('aria-labelledby', 'start-title');
+  boot.setAttribute('aria-busy', 'false');
+  startScreen.setAttribute('aria-hidden', 'false');
+  bootLoading?.setAttribute('aria-hidden', 'true');
+  syncSelection();
+
+  await new Promise((resolve) => {
+    const cleanups = [];
+    const listen = (target, type, handler) => {
+      target.addEventListener(type, handler);
+      cleanups.push(() => target.removeEventListener(type, handler));
+    };
+    const finish = () => {
+      config.setQuality(selectedQuality);
+      saveQualityPreference(selectedQuality);
+      bootProfile = `Qualität: ${QUALITY_LABEL[config.quality] ?? config.quality} · WebGL 2`;
+      startButton.disabled = true;
+      startButton.textContent = 'Spiel wird vorbereitet …';
+      for (const cleanup of cleanups) cleanup();
+      resolve();
+    };
+
+    for (let index = 0; index < startQualityButtons.length; index++) {
+      const button = startQualityButtons[index];
+      listen(button, 'click', () => selectQuality(button.dataset.startQuality));
+      listen(button, 'keydown', (event) => {
+        let next = index;
+        if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % startQualityButtons.length;
+        else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+          next = (index - 1 + startQualityButtons.length) % startQualityButtons.length;
+        } else if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = startQualityButtons.length - 1;
+        else return;
+        event.preventDefault();
+        selectQuality(startQualityButtons[next].dataset.startQuality, true);
+      });
+    }
+    listen(startButton, 'click', finish);
+    startQualityButtons.find((button) => button.dataset.startQuality === selectedQuality)
+      ?.focus({ preventScroll: true });
+  });
+}
+
 function showBootError(err, stepId = activeBootStepId) {
   const message = String(err?.message ?? err ?? 'Unbekannter Fehler');
   if (stepId) setBootStep(stepId, 'error');
@@ -232,6 +353,7 @@ function beginQualityReload(name) {
   if (qualityReloadStarted) return true;
   if (name === config.quality) return false;
   qualityReloadStarted = true;
+  saveQualityPreference(name);
 
   const label = QUALITY_LABEL[name] ?? name;
   const nextUrl = new URL(location.href);
@@ -312,6 +434,8 @@ function finishBoot(immediate = false) {
   setTimeout(() => { boot.style.display = 'none'; }, 220);
 }
 
+await waitForStartChoice();
+revealBootProgress();
 if (boot) boot.setAttribute('aria-busy', 'true');
 setBoot(
   qualityTransition

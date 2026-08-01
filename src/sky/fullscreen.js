@@ -48,15 +48,22 @@ export function blit(renderer, material, target) {
   renderer.render(_scene, _camera);
 }
 
-/** A full-screen shader step. Uniform objects may be shared between passes. */
+/**
+ * A full-screen shader step. Uniform objects may be shared between passes.
+ *
+ * `vertexShader` overrides SKY_VERT for the one thing a full-screen triangle's
+ * vertex stage is genuinely useful for: fetching a value that is the same on
+ * every fragment. Three vertices against a million pixels — see AMBIENT_VERT in
+ * volumetrics.js.
+ */
 export class SkyPass {
-  constructor(name, fragmentShader, uniforms, defines = {}) {
+  constructor(name, fragmentShader, uniforms, defines = {}, vertexShader = SKY_VERT) {
     this.uniforms = uniforms;
     this.material = new THREE.ShaderMaterial({
       name,
       uniforms,
       defines,
-      vertexShader: SKY_VERT,
+      vertexShader,
       fragmentShader,
       glslVersion: THREE.GLSL3,
       depthTest: false,

@@ -46,6 +46,12 @@ uniform vec3 uSunDir;
 uniform vec3 uMoonDir;
 uniform vec3 uSunIrradiance;      // scene light units, at the ground
 uniform vec3 uMoonIrradiance;
+// The same two irradiances already extinguished down to each cloud deck.
+// Frame constants -- see the note at the cloud block in skSample.
+uniform vec3 uCloudSunLow;
+uniform vec3 uCloudSunHigh;
+uniform vec3 uCloudMoonLow;
+uniform vec3 uCloudMoonHigh;
 uniform vec3 uSunDiscRadiance;    // radiance of the disc before extinction
 uniform vec3 uMoonDiscRadiance;
 uniform vec4 uDisc;               // x sun ang. radius, y moon ang. radius,
@@ -59,6 +65,16 @@ float owSkLum( vec3 c ) { return dot( c, vec3( 0.2126, 0.7152, 0.0722 ) ); }
 /** 2x1: texel 0 = cosine-weighted sky average, texel 1 = horizon band average. */
 uniform sampler2D uSkyAmbientLut;
 
+// MEASURED AND REJECTED. cod constfetch flags both of these as constant-coordinate
+// fetches, and volumetrics.js really did hoist the identical pair into flat
+// varyings (see AMBIENT_VERT there) for a genuine 1.67 M fetches a frame. The
+// difference is who includes this chunk. It is shared, and ENV_FRAG is one of the
+// consumers -- that path bakes the environment map and only re-runs when the sun
+// moves, so the two fetches are not per-frame there and a vertex stage would add
+// cost to a draw that currently pays almost nothing. Hoisting only in the dome's
+// own fragment path means forking the chunk, which is a copy of the LUT
+// convention in two places; that convention is exactly what the 2x1 comment
+// above exists to keep in one. Left as fetches deliberately.
 vec3 skAmbientSky() { return texture( uSkyAmbientLut, vec2( 0.25, 0.5 ) ).rgb; }
 vec3 skAmbientHorizon() { return texture( uSkyAmbientLut, vec2( 0.75, 0.5 ) ).rgb; }
 
@@ -190,11 +206,18 @@ vec3 skMoonDisc( vec3 rayDir, float theta, int oct ) {
 /**
  * @param rayDir  normalised world direction
  * @param quality 1 = screen, 0 = environment map (fewer octaves, no star points)
+ * @param ambSky  cosine-weighted whole-sky average -- skAmbientSky()
+ * @param ambHor  horizon band average -- skAmbientHorizon()
+ *
+ * THE TWO AMBIENTS ARE PARAMETERS, not calls, because they are the same two
+ * texels of a 2x1 LUT on every pixel of the draw. The screen pass reads them
+ * once per vertex and hands them over a flat varying -- three reads instead of
+ * 1.38 M, and flat means the value arrives unchanged rather than interpolated,
+ * so this is an accounting change and not a visual one. The equirect bake calls
+ * the two functions directly: it runs when the sun moves rather than every
+ * frame, and its vertex stage is shared with the rest of the sky subsystem.
  */
-vec3 skSample( vec3 rayDir, int quality ) {
-  vec3 ambSky = skAmbientSky();
-  vec3 ambHor = skAmbientHorizon();
-
+vec3 skSample( vec3 rayDir, int quality, vec3 ambSky, vec3 ambHor ) {
   vec3 col = skSkyView( rayDir, uSunDir );
 
   float cosS = dot( rayDir, uSunDir );
@@ -212,17 +235,23 @@ vec3 skSample( vec3 rayDir, int quality ) {
   // ---- clouds -------------------------------------------------------------
   // The two decks sit at very different altitudes, so they see very different
   // solar spectra: the cumulus at 1.5 km looks through nearly the whole aerosol
-  // column while the cirrus at 7.8 km is above most of it. Sampling the
-  // transmittance LUT at each deck's own altitude is what makes a sunset read
-  // as pink cirrus over orange-grey cumulus instead of one flat orange wash.
-  vec3 pLow  = vec3( 0.0, SK_GROUND_R + 0.0015, 0.0 );
-  vec3 pHigh = vec3( 0.0, SK_GROUND_R + 0.0078, 0.0 );
-  vec3 sunLow   = uSunIrradiance  * skTransmittance( pLow,  uSunDir );
-  vec3 sunHigh  = uSunIrradiance  * skTransmittance( pHigh, uSunDir );
-  vec3 moonLow  = uMoonIrradiance * skTransmittance( pLow,  uMoonDir );
-  vec3 moonHigh = uMoonIrradiance * skTransmittance( pHigh, uMoonDir );
-  vec4 cl = skClouds( rayDir, uSunDir, sunLow, sunHigh,
-                      uMoonDir, moonLow, moonHigh, ambSky, quality );
+  // column while the cirrus at 7.8 km is above most of it. Extinguishing each
+  // deck's irradiance at its own altitude is what makes a sunset read as pink
+  // cirrus over orange-grey cumulus instead of one flat orange wash.
+  //
+  // THESE FOUR ARE UNIFORMS AND USED TO BE FOUR LUT FETCHES. Every factor in
+  // them is constant over the draw -- the deck altitudes are compile-time and
+  // the LUT position is on the +Y axis, so skLutUv collapses to
+  // ( 0.5 + 0.5 * dir.y, alt / 0.1 ) with no rayDir in it anywhere -- so the
+  // shader was rebuilding the same four colours on every one of 1.38 M sky
+  // pixels. SkySystem._updateCelestial now builds them once per sun movement
+  // with transmittanceLutSample, which reproduces the TAP and not the physics:
+  // the same four texels of the same 256x64 Float32 grid, the same bilinear
+  // blend, and the same 40-step bake WITHOUT the ground occlusion the honest
+  // integral has. Different by float rounding, not by construction. 5.5 M
+  // fetches a frame at 2268x1473.
+  vec4 cl = skClouds( rayDir, uSunDir, uCloudSunLow, uCloudSunHigh,
+                      uMoonDir, uCloudMoonLow, uCloudMoonHigh, ambSky, quality );
 
   // ---- night sky, BEHIND the decks ---------------------------------------
   // Stars have to be occluded by cloud. A star seen *through* an opaque cumulus
@@ -276,7 +305,11 @@ vec3 skSample( vec3 rayDir, int quality ) {
 const DOME_VERT = /* glsl */ `
 uniform mat4 uInvProj;
 uniform mat4 uCamWorld;
+uniform sampler2D uSkyAmbientLut;
 out vec3 vRay;
+// The 2x1 ambient LUT, fetched here rather than per fragment. See skSample.
+flat out vec3 vAmbCool;
+flat out vec3 vAmbHor;
 void main() {
   vec2 ndc = position.xy;
   vec4 h = uInvProj * vec4( ndc, 1.0, 1.0 );
@@ -285,6 +318,8 @@ void main() {
   // so interpolating it and normalising in the fragment shader is exact.
   vd /= max( 1.0e-6, -vd.z );
   vRay = mat3( uCamWorld ) * vd;
+  vAmbCool = texture( uSkyAmbientLut, vec2( 0.25, 0.5 ) ).rgb;
+  vAmbHor = texture( uSkyAmbientLut, vec2( 0.75, 0.5 ) ).rgb;
   gl_Position = vec4( ndc, 1.0, 1.0 );
 }
 `;
@@ -293,9 +328,11 @@ const DOME_FRAG = /* glsl */ `
 precision highp float;
 ${SKY_BODY}
 in vec3 vRay;
+flat in vec3 vAmbCool;
+flat in vec3 vAmbHor;
 layout(location = 0) out vec4 fragColor;
 void main() {
-  fragColor = vec4( skSample( normalize( vRay ), 1 ), 1.0 );
+  fragColor = vec4( skSample( normalize( vRay ), 1, vAmbCool, vAmbHor ), 1.0 );
 }
 `;
 
@@ -310,7 +347,8 @@ void main() {
   float lat = ( vUv.y - 0.5 ) * SK_PI;
   float cl = cos( lat );
   vec3 dir = vec3( cl * cos( az ), sin( lat ), cl * sin( az ) );
-  fragColor = vec4( skSample( normalize( dir ), 0 ), 1.0 );
+  fragColor = vec4(
+    skSample( normalize( dir ), 0, skAmbientSky(), skAmbientHorizon() ), 1.0 );
 }
 `;
 
@@ -332,7 +370,31 @@ export class SkyDome {
       fragmentShader: DOME_FRAG,
       glslVersion: THREE.GLSL3,
       side: THREE.DoubleSide,
-      depthTest: false,
+      // DEPTH-TESTED, even though this is drawn first and writes no depth.
+      //
+      // The forward pass inherits the prepass depth buffer (see the
+      // `reusePrepassDepth` note in render/index.js), so by the time this quad
+      // is drawn every opaque pixel in the frame already holds its final depth.
+      // The quad sits at NDC z = 1 -- the far plane -- so LEQUAL passes exactly
+      // where nothing was written (the depth clear leaves 1.0 there, which is
+      // the sky) and fails on every covered pixel. Nothing writes depth here and
+      // the shader has no discard or gl_FragDepth, so the rejection is early-Z:
+      // skSample is never entered on a pixel geometry is about to overwrite.
+      //
+      // Measured over the reference frame, 58.8% of the pixels are covered, and
+      // this pass was paying its 10 LUT fetches plus the whole atmosphere,
+      // cloud and star evaluation on every one of them for a colour that the
+      // world pass then wrote over. Output is unchanged: the pixels that stop
+      // being shaded are precisely the ones whose result was discarded.
+      //
+      // Correct in the other configurations too, just without the saving. With
+      // the prepass off, or on the direct-viewmodel path, `reusePrepassDepth` is
+      // false and the forward pass clears depth to 1.0 first, so LEQUAL passes
+      // everywhere and this behaves exactly as the untested quad did. Opaque
+      // geometry the prepass cannot reproduce (an alpha cut outside
+      // `canPrepassAlphaTest`) leaves 1.0 behind as well, so it is shaded here
+      // and then overdrawn -- the old cost, never a wrong pixel.
+      depthTest: true,
       depthWrite: false,
       blending: THREE.NoBlending,
       fog: false,

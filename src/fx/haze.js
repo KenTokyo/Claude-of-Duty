@@ -59,6 +59,20 @@ layout(location = 0) out vec4 outColor;
 void main() {
   vec2 d = texture2D( tDistort, vUvw ).xy * uStrength.x;
   d = clamp( d, vec2( -0.03 ), vec2( 0.03 ) );
+
+  // The distortion buffer is cleared to zero and written only where a sprite
+  // lands, so on an ordinary frame the overwhelming majority of the screen has
+  // d exactly zero -- and there the three chromatic taps below are three
+  // fetches of the SAME texel: vUvw + 0.0 * k is vUvw for every k, and the
+  // result vec4( c.r, c.g, c.b, c.a ) is c. Returning c is therefore the same
+  // value bit for bit, not an approximation of it. The pass is only enabled
+  // while a distortion sprite is alive, so this is the difference between
+  // paying for the effect where it exists and paying for it everywhere.
+  if ( d == vec2( 0.0 ) ) {
+    outColor = texture2D( tColor, vUvw );
+    return;
+  }
+
   // Chromatic split across the refraction so the smear reads as air, not blur.
   float r = texture2D( tColor, vUvw + d * 1.08 ).r;
   vec4 c = texture2D( tColor, vUvw + d );

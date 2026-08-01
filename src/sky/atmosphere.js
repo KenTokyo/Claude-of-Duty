@@ -328,6 +328,106 @@ export function transmittanceToSpace(mu, mieScale = 1, out = [0, 0, 0]) {
   return out;
 }
 
+/** Transmittance LUT dimensions — must match `luts.js`. */
+const TLUT_W = 256;
+const TLUT_H = 64;
+const _t00 = [0, 0, 0];
+const _t10 = [0, 0, 0];
+const _t01 = [0, 0, 0];
+const _t11 = [0, 0, 0];
+
+/**
+ * ONE TEXEL of the transmittance LUT, evaluated on the CPU.
+ *
+ * Deliberately NOT `transmittanceToSpace` with an altitude argument, and the
+ * difference is the whole point. That function is the physics; this one is a
+ * transcription of `TRANSMITTANCE_FRAG` in luts.js, and it reproduces the two
+ * places the bake departs from the physics on purpose:
+ *
+ *   - 40 steps, not 48.
+ *   - NO ground occlusion. The bake takes `skRaySphere( pos, dir, SK_TOP_R )`
+ *     and nothing else, so below the local horizon it integrates straight
+ *     THROUGH the planet and comes out with a very small but non-zero number
+ *     where the physical answer is exactly zero.
+ *
+ * A caller that wants the truth wants `transmittanceToSpace`. A caller that
+ * wants to stop the GPU making this lookup wants this one, because agreeing
+ * with the rest of the sky matters more here than being right on its own.
+ *
+ * @param row  LUT row index, 0..63. Altitude is mix( GROUND, TOP, (row+0.5)/64 ).
+ * @param mu   cosine with the local zenith, already the texel's own value.
+ */
+function transmittanceLutTexel(row, mu, mieScale, out) {
+  const v = (row + 0.5) / TLUT_H;
+  const R = ATMO.groundRadiusMM + (ATMO.atmosphereRadiusMM - ATMO.groundRadiusMM) * v;
+  const top = ATMO.atmosphereRadiusMM;
+  // skRaySphere against the top shell from inside it: c < 0, so d > b*b and the
+  // far root is the one taken. Same expression, same branch.
+  const t = -R * mu + Math.sqrt(R * R * mu * mu - R * R + top * top);
+  if (!(t > 0)) {
+    out[0] = out[1] = out[2] = 0;
+    return out;
+  }
+  const dt = t / 40;
+  let od0 = 0;
+  let od1 = 0;
+  let od2 = 0;
+  for (let i = 0; i < 40; i++) {
+    const s = (i + 0.5) * dt;
+    const h = Math.sqrt(R * R + s * s + 2 * R * s * mu);
+    mediumJs(Math.max(0, (h - ATMO.groundRadiusMM) * 1000), mieScale, _ext);
+    od0 += _ext[0] * dt;
+    od1 += _ext[1] * dt;
+    od2 += _ext[2] * dt;
+  }
+  out[0] = Math.exp(-od0);
+  out[1] = Math.exp(-od1);
+  out[2] = Math.exp(-od2);
+  return out;
+}
+
+/**
+ * `skTransmittance( vec3( 0, SK_GROUND_R + altMM, 0 ), dir )` without the GPU.
+ *
+ * The shader's `skLutUv` reduces to (0.5 + 0.5*mu, altMM / 0.1) for a position
+ * on the +Y axis, which is every position this is used for, so `mu` is just
+ * `dir.y`. What is reproduced here is the whole tap and not just the integral:
+ * the same two grid coordinates, the same four texels, the same bilinear blend
+ * and the same clamp-to-edge. That is what makes swapping a fetch for a uniform
+ * an accounting change rather than a visual one -- the LUT is a Float32 target
+ * (see fullscreen.js), so the only gap left is float64-vs-float32 rounding on a
+ * value that was already going to be interpolated.
+ *
+ * Cost is 4 texels x 40 steps of scalar math, on the sun-moved path only.
+ */
+export function transmittanceLutSample(altMM, mu, mieScale = 1, out = [0, 0, 0]) {
+  const u = Math.min(1, Math.max(0, 0.5 + 0.5 * mu));
+  const v = Math.min(1, Math.max(0,
+    altMM / (ATMO.atmosphereRadiusMM - ATMO.groundRadiusMM)));
+  // Texel centres sit at (i+0.5)/N, so the sample lands between floor(x-0.5)
+  // and that plus one -- the same half-texel shift the sampler applies.
+  const x = u * TLUT_W - 0.5;
+  const y = v * TLUT_H - 0.5;
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const fx = x - x0;
+  const fy = y - y0;
+  const cx = (i) => Math.min(TLUT_W - 1, Math.max(0, i));
+  const cy = (i) => Math.min(TLUT_H - 1, Math.max(0, i));
+  // A column's mu is fixed by its own texel centre, which is what the bake used.
+  const muOf = (i) => (cx(i) + 0.5) / TLUT_W * 2 - 1;
+  transmittanceLutTexel(cy(y0), muOf(x0), mieScale, _t00);
+  transmittanceLutTexel(cy(y0), muOf(x0 + 1), mieScale, _t10);
+  transmittanceLutTexel(cy(y0 + 1), muOf(x0), mieScale, _t01);
+  transmittanceLutTexel(cy(y0 + 1), muOf(x0 + 1), mieScale, _t11);
+  for (let c = 0; c < 3; c++) {
+    const a = _t00[c] + (_t10[c] - _t00[c]) * fx;
+    const b = _t01[c] + (_t11[c] - _t01[c]) * fx;
+    out[c] = a + (b - a) * fy;
+  }
+  return out;
+}
+
 /** Rec.709 luminance — used to split transmittance into colour + intensity. */
 export function luminance(rgb) {
   return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];

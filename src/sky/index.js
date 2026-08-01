@@ -7,12 +7,13 @@ import {
   SUN_ILLUMINANCE_TOP,
   MOON_ILLUMINANCE_NIGHT,
   transmittanceToSpace,
+  transmittanceLutSample,
 } from './atmosphere.js';
 import { SkyLuts } from './luts.js';
 import { SkyDome } from './dome.js';
 import { Volumetrics } from './volumetrics.js';
 import { Celestial } from './celestial.js';
-import { cloudSunOcclusion } from './clouds.js';
+import { cloudSunOcclusion, CLOUD_LOW_MM, CLOUD_HIGH_MM } from './clouds.js';
 
 /**
  * Floor on the beam's *luminous* transmittance, as a fraction of unity — see
@@ -237,6 +238,14 @@ export class SkySystem {
       uSunAltitude: { value: 0 },
       uMoonAltitude: { value: 0 },
       uMoonRelAz: { value: 0 },
+
+      // Sun/moon irradiance already extinguished down to each cloud deck --
+      // frame constants that skSample used to rebuild from four LUT taps on
+      // every sky pixel. Filled in _updateCelestial.
+      uCloudSunLow: { value: new THREE.Vector3() },
+      uCloudSunHigh: { value: new THREE.Vector3() },
+      uCloudMoonLow: { value: new THREE.Vector3() },
+      uCloudMoonHigh: { value: new THREE.Vector3() },
       // x/y are the true angular radii of the sun and moon; z/w scale them up for
       // readability. 3.0 puts the solar disc at 1.6 degrees across — a 22 pixel
       // dot in a 75-degree frame, which is the smallest that still reads as a disc
@@ -358,6 +367,7 @@ export class SkySystem {
     this._beamLuminance = 0;
     this._sunT = [0, 0, 0];
     this._moonT = [0, 0, 0];
+    this._deckT = [0, 0, 0];
     this._envSunDir = new THREE.Vector3(0, -1, 0);
     this._tmp = new THREE.Vector3();
     this._tmp2 = new THREE.Vector3();
@@ -679,6 +689,30 @@ export class SkySystem {
 
     const moonIrr = MOON_ILLUMINANCE_NIGHT * c.moonPhase * keyRamp;
     s.uMoonIrradiance.value.set(moonIrr * cool[0], moonIrr * cool[1], moonIrr * cool[2]);
+
+    // ---- cloud deck irradiances --------------------------------------------
+    // skSample used to compute these four with four skTransmittance() taps, and
+    // every factor in them is a uniform: the two deck altitudes are constants
+    // and the LUT position is on the +Y axis, so `skLutUv` collapses to
+    // ( 0.5 + 0.5 * dir.y, alt / 0.1 ) and the whole expression is the same
+    // colour on every pixel of the frame. Four full-resolution LUT fetches per
+    // sky pixel for four numbers that change when the sun moves -- 5.5 M
+    // fetches a frame at 2268x1473 with 41% sky.
+    //
+    // transmittanceLutSample reproduces the TAP and not the physics: same grid,
+    // same four texels, same bilinear blend, same 40-step bake without the
+    // ground test. See the note on it in atmosphere.js for why that is the
+    // right choice here even though the honest integral is one call away.
+    const deck = (altMM, mu, irr, target) => {
+      transmittanceLutSample(altMM, mu, mie, this._deckT);
+      target.value.set(irr.x * this._deckT[0], irr.y * this._deckT[1], irr.z * this._deckT[2]);
+    };
+    const sunIrr = s.uSunIrradiance.value;
+    const moonIrrV = s.uMoonIrradiance.value;
+    deck(CLOUD_LOW_MM, c.sun.y, sunIrr, s.uCloudSunLow);
+    deck(CLOUD_HIGH_MM, c.sun.y, sunIrr, s.uCloudSunHigh);
+    deck(CLOUD_LOW_MM, c.moon.y, moonIrrV, s.uCloudMoonLow);
+    deck(CLOUD_HIGH_MM, c.moon.y, moonIrrV, s.uCloudMoonHigh);
 
     // Day: a pale disc a little above the daytime sky, which is what the moon
     // actually looks like at 16:30. Night: far enough above the night sky to

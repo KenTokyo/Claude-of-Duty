@@ -14,17 +14,21 @@ pnpm install
 pnpm dev             # http://127.0.0.1:5178
 ```
 
-Click the canvas to lock the cursor. WASD move, mouse aim, LMB fire, RMB ADS,
-R reload, Shift sprint, Ctrl crouch, Space jump, Q/E lean, Esc release.
+Choose a graphics profile on the launch screen, then start the game. Click the
+canvas to lock the cursor. WASD move, mouse aim, LMB fire, RMB ADS, R reload,
+Shift sprint, Ctrl crouch, Space jump, Q/E lean, Esc release.
 
 ### Performance profiles
 
-Normal play now starts on the **low forward profile** so weaker Windows/ANGLE
-machines reach gameplay instead of compiling the full cinematic pipeline for
-minutes. It keeps WebGL2, one CSM shadow cascade, PBR textures, instancing, bloom
-and adaptive resolution, while omitting the MRT prepass and depth-driven effects.
+Normal play opens a launch screen **before the renderer and game world initialize**.
+Low, medium, high and ultra are selectable there, and the last selection is
+remembered. The first visit preselects the **low forward profile** so weaker
+Windows/ANGLE machines can reach gameplay without compiling the full cinematic
+pipeline for minutes. It keeps WebGL2, one CSM shadow cascade, PBR textures,
+instancing, bloom and adaptive resolution, while omitting the MRT prepass and
+depth-driven effects.
 
-- `?q=medium`, `?q=high`, `?q=ultra` opt into the richer pipelines.
+- `?q=low`, `?q=medium`, `?q=high`, `?q=ultra` start a profile directly and bypass the launch screen.
 - `?prewarm=1` opts into exhaustive shader precompilation. It is intentionally
   off for normal play because some ANGLE/D3D11 drivers stall or reset under that
   compilation burst.

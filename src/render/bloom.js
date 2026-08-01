@@ -21,14 +21,37 @@ import { Pass, hdrTarget } from './pass.js';
  *    percentage instead of a milky haze over the whole frame.
  */
 
+/**
+ * Same hoist as composite.js: `tExposure` is a 1x1 target, so reading it per
+ * fragment was one texture instruction per pixel for a number constant over the
+ * draw. Per vertex it is 3 fetches per draw against 834 624 on level 0.
+ *
+ * It is read UNCONDITIONALLY here even though the fragment stage only uses it
+ * when uParams.x > 0.5. That is not a regression: the pyramid runs the same
+ * material at six resolutions, so the old cost was 834 624 fetches on the one
+ * level whose branch fires and 0 on the five below, and the new cost is 3 on all
+ * six. The branch stays in the fragment shader because it selects between the
+ * Karis prefilter and the plain tent, which is a great deal more than a multiply.
+ */
+const DOWNSAMPLE_VERT = /* glsl */ `
+uniform sampler2D tExposure;
+varying vec2 vUv;
+flat out float vExposure;
+void main() {
+  vUv = position.xy * 0.5 + 0.5;
+  vExposure = texture2D( tExposure, vec2( 0.5 ) ).r;
+  gl_Position = vec4( position.xy, 0.0, 1.0 );
+}
+`;
+
 const DOWNSAMPLE = /* glsl */ `
 precision highp float;
 ${COMMON}
 uniform sampler2D tSrc;
-uniform sampler2D tExposure;
 uniform vec2 uTexel;      // texel size of the SOURCE
 uniform vec4 uParams;     // x karis, y threshold, z knee
 varying vec2 vUv;
+flat in float vExposure;
 
 vec3 fetch( vec2 uv ) { return max( texture2D( tSrc, uv ).rgb, vec3( 0.0 ) ); }
 float karisWeight( vec3 c ) { return 1.0 / ( 1.0 + owLum( c ) ); }
@@ -64,7 +87,7 @@ void main() {
     // exposure first so the firefly clamp AND the threshold are both in
     // display-referred terms — a fixed linear threshold on unscaled radiance
     // would mean something different at every time of day.
-    float ex = texture2D( tExposure, vec2( 0.5 ) ).r;
+    float ex = vExposure;
     a *= ex; b *= ex; c *= ex; d *= ex; e *= ex; f *= ex; g *= ex;
     h *= ex; i *= ex; j *= ex; k *= ex; l *= ex; m *= ex;
     float thr = uParams.y;
@@ -135,7 +158,7 @@ export class Bloom {
       tExposure: { value: null },
       uTexel: { value: new THREE.Vector2() },
       uParams: { value: new THREE.Vector4(0, 1.0, 0.6, 0) },
-    });
+    }, { vertexShader: DOWNSAMPLE_VERT });
     /** Soft-knee threshold in exposure-scaled linear light. */
     this.threshold = 1.0;
     this.knee = 0.6;

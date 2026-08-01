@@ -1,5 +1,5 @@
 {
   "version": 1,
-  "initialSystemPrompt": "LESE CLAUDE.md und danach in shared-docs shared-docs/CODING-RULES",
-  "updatedAt": "2026-07-31T23:28:56.263Z"
+  "initialSystemPrompt": ".",
+  "updatedAt": "2026-08-01T14:24:42.981Z"
 }

@@ -12,6 +12,7 @@
  *   node tools/capture.mjs --list
  */
 import { chromium } from 'playwright';
+import { launchBrowser } from "./launch.mjs";
 import { spawn } from 'node:child_process';
 import { mkdirSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -60,9 +61,7 @@ async function ensureServer() {
 
 const server = await ensureServer();
 
-const browser = await chromium.launch({
-  headless: true,
-  args: [
+const browser = await launchBrowser(chromium, args, [
     '--use-angle=metal',
     '--enable-unsafe-webgpu',
     '--ignore-gpu-blocklist',
@@ -73,8 +72,7 @@ const browser = await chromium.launch({
     '--force-device-scale-factor=1',
     '--hide-scrollbars',
     '--mute-audio',
-  ],
-});
+  ]);
 
 const page = await browser.newPage({
   viewport: { width: W, height: H },

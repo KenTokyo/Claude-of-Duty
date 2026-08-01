@@ -91,16 +91,64 @@ void main() {
       //
       // +1 px minimum: a sample that lands back on the centre texel produces a
       // garbage horizon direction that closes the visibility arc completely.
+      //
+      // MEASURED AND REJECTED: an out-of-radius break before the fetch. The
+      // claim was geometric and it is sound as far as it goes -- a tap updates
+      // the horizon with cosH = max( cosH, mix( c, cosH, fall ) ), and at
+      // fall == 1 that is bit-exactly the identity, so a sample that CANNOT land
+      // within the AO radius is a provable no-op. |ds| is unknown before the fetch,
+      // but a lower bound is not: the sample lies on the view ray through the
+      // offset uv, and the nearest that ray comes to P is |P| sin(theta), which
+      // depends only on the screen offset. Solving that bound for the offset
+      // gives an offMax per (pixel, slice), and because off grows
+      // monotonically in t the test is a break rather than a continue.
+      //
+      // It fires on NOTHING. Evaluated per pixel over the real depth field at
+      // this pass's own resolution with the frame's own uniforms: 48 taps per
+      // covered pixel, 0.00% of them skippable, 0.000 fetches saved per frame
+      // pixel. The reason is radiusPx = clamp( .., 6, 128 ) two lines up -- the
+      // clamp keeps the sampled disc well inside the world radius at every depth
+      // the frame actually contains, so the bound is never reached. It would
+      // only start paying on geometry far enough away for the unclamped radiusPx
+      // to fall under 6 px, and at that distance the pass is being upsampled
+      // from a quarter-resolution buffer anyway. Do not re-derive this: the
+      // algebra is correct and the answer is still zero.
+      //
+      // ALSO MEASURED AND REJECTED, and it is a DIFFERENT argument from the one
+      // above, so rejecting one does not reject the other: skipping a step that
+      // lands on a texel the previous step already read. tDepth is
+      // NearestFilter, so two taps inside one texel return the same number and
+      // the second buys only a slightly different reconstruction of a value
+      // already held -- worth 6 fetches, since off does not depend on the
+      // slice. The ladder below is quadratic, so at radiusPx = 6 the first
+      // three steps span 0.6 px and the case is real.
+      //
+      // It is worth 0.06 fetches per fragment, 0.2 % of this loop. The reason
+      // is the frame, not the algebra: cod gtaosteps counts radiusPx over the
+      // real depth field and finds a mean of 86.5 px with 0.000 % of covered
+      // pixels at the clamp FLOOR -- 77 % of the frame is inside 10 m and none
+      // of it beyond 40 m, where radiusPx would have to fall under about 10 for
+      // two steps to share a texel. The other half of it is that the offsets
+      // are scaled by uTexel, which is the PASS's 1134x736, while tDepth is the
+      // full-resolution 2268x1473 gbuffer depth: one pass texel is TWO depth
+      // texels, so a gap has to close to half a pass texel before it closes to
+      // one depth texel. See the header of tools/cli/gtaosim.mjs.
       float ft = ( float( t ) + noise2 ) / float( OW_STEPS );
       float off = radiusPx * ft * ft + 1.0;
       vec2 duv = dir2 * off * uTexel;
+
+      // Coverage is read off the DEPTH texture, not off normal.z. The prepass
+      // clears to zero and no drawn fragment can have a view depth of 0 (it
+      // would be behind the near plane), so testing d > 0.0 is exactly the old
+      // cov > 0.5 test at half the bandwidth — this loop is 48 fetches per
+      // pixel instead of 96, and it is the hottest loop in the frame.
+      // See the contract note in prepass.js render().
 
       // +dir
       vec2 uv1 = vUv + duv;
       if ( uv1.x > 0.0 && uv1.x < 1.0 && uv1.y > 0.0 && uv1.y < 1.0 ) {
         float d1 = texture2D( tDepth, uv1 ).r;
-        float cov1 = texture2D( tNormal, uv1 ).z;
-        if ( cov1 > 0.5 ) {
+        if ( d1 > 0.0 ) {
           vec3 ds = owViewPos( uv1, d1, uProjInv ) - P;
           float len2 = dot( ds, ds );
           if ( len2 > 2e-5 ) {
@@ -117,8 +165,7 @@ void main() {
       vec2 uv2 = vUv - duv;
       if ( uv2.x > 0.0 && uv2.x < 1.0 && uv2.y > 0.0 && uv2.y < 1.0 ) {
         float d2 = texture2D( tDepth, uv2 ).r;
-        float cov2 = texture2D( tNormal, uv2 ).z;
-        if ( cov2 > 0.5 ) {
+        if ( d2 > 0.0 ) {
           vec3 ds = owViewPos( uv2, d2, uProjInv ) - P;
           float len2 = dot( ds, ds );
           if ( len2 > 2e-5 ) {
@@ -163,6 +210,39 @@ varying vec2 vUv;
 
 void main() {
   vec2 cur = texture2D( tCurrent, vUv ).rg;
+
+  // Sky: AO_CORE writes vec4( 1.0, 1e4, 0, 1 ) wherever the gbuffer has no
+  // normal, so .g carries 1e4 as a sentinel and .r carries a SCREEN CONSTANT of
+  // 1.0. Both facts are needed, and together they make the rest of this shader a
+  // no-op on the sky. .g is passed through untouched either way, so only .r has
+  // to be argued, and it comes out as cur.x in all three cases:
+  //
+  //   history reprojects onto sky   rel is 0 and w stays uFeedback, but hist.x
+  //                                 is that same 1.0 constant, and the clamp
+  //                                 window is [ mn - 0.45, mx + 0.45 ] with
+  //                                 mn <= cur.x <= mx, so it always contains
+  //                                 cur.x +- 0.45 and cannot move hist.x off it.
+  //                                 h == cur.x, and mix( x, x, w ) is x.
+  //   history reprojects onto geometry  the world camera's far plane is 1200, so
+  //                                 hist.y <= 1200 against cur.y of 1e4 gives
+  //                                 rel >= 0.88 and w <= uFeedback * exp( -26.4 )
+  //                                 = 3.4e-12. h is inside [ -0.45, 1.45 ], so
+  //                                 the result differs from cur.x by at most
+  //                                 1.45 * 3.4e-12 = 4.9e-12.
+  //   history lands off screen      w is set to 0 outright and mix returns cur.x.
+  //
+  // The target is HalfFloatType/RGFormat, whose step at 1.0 is 4.9e-4 -- eight
+  // orders of magnitude above that worst deficit, so the write is bit for bit
+  // the same value. (In float32, whose step at 1.0 is 6.0e-8, it still is.)
+  // The 1e4 sentinel itself is exact in half float: the step at 10000 is 8 and
+  // 10000 / 8 is a whole number, so it survives every round trip unchanged.
+  //
+  // On a 41% sky frame this is 6 of the pass's 7 fetches on 41% of it.
+  if ( cur.y > 2000.0 ) {
+    gl_FragColor = vec4( cur.x, cur.y, 0.0, 1.0 );
+    return;
+  }
+
   vec2 vel = texture2D( tVelocity, vUv ).rg;
   vec2 huv = vUv - vel;
 
@@ -197,6 +277,34 @@ varying vec2 vUv;
 
 void main() {
   vec2 c = texture2D( tAo, vUv ).rg;
+
+  // Sky, and the six neighbour fetches below provably cannot move the answer.
+  //
+  // AO_CORE writes vec4( 1.0, 1e4, 0, 1 ) wherever the gbuffer has no normal,
+  // and AO_TEMPORAL passes .g through as cur.y untouched, so 1e4 still marks the
+  // sky here. Geometry cannot reach it: .g is POSITIVE LINEAR VIEW DEPTH in
+  // metres and the camera far plane is 1200, so the test below has eight times
+  // the margin it needs in one direction and five in the other.
+  //
+  // With c.g = 1e4 the bilateral weight of a neighbour at a real depth d is
+  // w0 * exp( -( 1e4 - d ) * 22 / 1e4 ) <= w0 * exp( -21.98 ) = 2.9e-10, while
+  // every sky neighbour keeps its full w0 AND carries .r = 1.0. So the sum is
+  // S * 1.0 + e over S + E, where S >= 0.4 is the sky weight including the 0.4
+  // centre tap, E <= 2.5e-10 is the total geometry weight and 0 <= e <= E. That
+  // is at worst 1 - E/S = 1 - 6.2e-10, and the intensity curve pow( x, 1.25 )
+  // at most scales the deficit by 1.25.
+  //
+  // The target is HalfFloatType, whose step at 1.0 is 4.9e-4 -- six orders of
+  // magnitude coarser. So this is not a close approximation of the loop below,
+  // it is the same stored value. (It would still round to 1.0 in float32, whose
+  // step at 1.0 is 6.0e-8.) 1e4 itself is exact in half float: the step at
+  // 10000 is 8 and 10000 / 8 is a whole number, so the sentinel survives every
+  // round trip through these targets unchanged.
+  if ( c.g > 2000.0 ) {
+    gl_FragColor = vec4( 1.0, c.g, 0.0, 1.0 );
+    return;
+  }
+
   float sum = c.r * 0.4;
   float wsum = 0.4;
   for ( int i = 1; i <= 3; i ++ ) {

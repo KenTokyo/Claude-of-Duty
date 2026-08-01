@@ -94,6 +94,13 @@ uniform vec4 uParams;   // x dt, y speedUp, z speedDown, w manual EV bias
 uniform vec4 uLimits;   // x minEV, y maxEV, z reset, w keyScale
 varying vec2 vUv;
 
+// MEASURED AND REJECTED, twice. cod constfetch flags the two texture2D calls in
+// this shader as constant-coordinate fetches that a vertex stage could hoist
+// into flat varyings. It is right about the classification and wrong about the
+// saving: this pass renders into a 1x1 target. Two fetches is the whole cost of
+// the whole draw, and a vertex hoist would trade them for three vertices x two
+// fetches, which is six. The finding is real and the fix is a net loss; it is
+// recorded here so the next sweep does not have to rediscover that.
 void main() {
   vec2 s = texture2D( tSrc, vec2( 0.5 ) ).rg;
   float avgLogLum = s.x / max( s.y, 1e-4 );

@@ -12,6 +12,36 @@ import { Pass } from './pass.js';
  * is a single read/write rather than one per effect.
  */
 
+/**
+ * The exposure fetch, hoisted to the three vertices of the full-screen triangle.
+ *
+ * `tExposure` is a 1x1 FloatType target (AutoExposure.adapt), so
+ * `texture2D( tExposure, vec2( 0.5 ) )` returned the same texel on all 3.34 M
+ * pixels — one texture instruction per pixel to read a number that is constant
+ * over the whole draw. Reading it per vertex is 3 fetches instead of 3 340 764.
+ *
+ * `flat` is what makes this bit-identical rather than merely equal: the value
+ * arrives from the provoking vertex with no interpolation, so it is the same
+ * bits the fragment stage used to fetch, not a barycentric average of three
+ * copies that a compiler is free to compute in a different order. It is legal
+ * here despite the ESSL 1.00 spellings below because three.js compiles every
+ * ShaderMaterial as `#version 300 es` — see the note on Pass in pass.js.
+ *
+ * The multiply by uLook.w rides along: it is a uniform too, so the whole
+ * expression the fragment stage needs is finished before rasterisation starts.
+ */
+const COMPOSITE_VERT = /* glsl */ `
+uniform sampler2D tExposure;
+uniform vec4 uLook;
+varying vec2 vUv;
+flat out float vExposure;
+void main() {
+  vUv = position.xy * 0.5 + 0.5;
+  vExposure = texture2D( tExposure, vec2( 0.5 ) ).r * uLook.w;
+  gl_Position = vec4( position.xy, 0.0, 1.0 );
+}
+`;
+
 const COMPOSITE = /* glsl */ `
 precision highp float;
 ${COMMON}
@@ -19,7 +49,6 @@ ${TONEMAP}
 
 uniform sampler2D tColor;
 uniform sampler2D tBloom;
-uniform sampler2D tExposure;
 uniform sampler3D tLut;
 
 uniform vec2 uTexel;
@@ -27,7 +56,10 @@ uniform vec2 uResolution;
 uniform vec4 uLens;      // x chromatic, y vignette, z grainAmount, w time
 uniform vec4 uGrade;     // x bloomStrength, y lutStrength, z sharpen, w lutSize
 uniform vec4 uLook;      // x agx slope, y agx power, z agx sat, w exposureBias
+uniform float uRecon;    // edge-directed upscale strength; 0 at native res
 varying vec2 vUv;
+// Already multiplied by uLook.w in COMPOSITE_VERT.
+flat in float vExposure;
 
 vec3 sampleLut( vec3 c ) {
   float n = uGrade.w;
@@ -36,30 +68,93 @@ vec3 sampleLut( vec3 c ) {
 }
 
 void main() {
-  float exposure = texture2D( tExposure, vec2( 0.5 ) ).r * uLook.w;
-
   vec2 d = vUv - 0.5;
   float r2 = dot( d, d );
 
   // --- chromatic aberration: sample the scene three times with a radial
   //     offset that grows toward the corners, like a real lens
-  vec3 hdr;
+  //
+  // The centre tap is hoisted out and shared. Both arms of the branch fetched
+  // vUv already and the centre variable then fetched it a third time, for the
+  // same texel of the same texture in the same invocation. Starting from the
+  // centre and overwriting only the two shifted channels is arithmetically the
+  // same value: green is the centre either way, and the max( hdr, 0 ) below
+  // makes max( max( x, 0 ), 0 ) collapse to max( x, 0 ) on the channels that
+  // came through it.
+  vec3 centre = max( texture2D( tColor, vUv ).rgb, vec3( 0.0 ) );
+  vec3 hdr = centre;
   float ca = uLens.x * r2;
   if ( ca > 0.00002 ) {
     vec2 o = d * ca;
     hdr.r = texture2D( tColor, vUv + o ).r;
-    hdr.g = texture2D( tColor, vUv ).g;
     hdr.b = texture2D( tColor, vUv - o ).b;
-  } else {
-    hdr = texture2D( tColor, vUv ).rgb;
   }
-  vec3 centre = max( texture2D( tColor, vUv ).rgb, vec3( 0.0 ) );
   hdr = max( hdr, vec3( 0.0 ) );
 
   vec3 n1 = max( texture2D( tColor, vUv + vec2( uTexel.x, 0.0 ) ).rgb, vec3( 0.0 ) );
   vec3 n2 = max( texture2D( tColor, vUv - vec2( uTexel.x, 0.0 ) ).rgb, vec3( 0.0 ) );
   vec3 n3 = max( texture2D( tColor, vUv + vec2( 0.0, uTexel.y ) ).rgb, vec3( 0.0 ) );
   vec3 n4 = max( texture2D( tColor, vUv - vec2( 0.0, uTexel.y ) ).rgb, vec3( 0.0 ) );
+
+  // The five luminances of the tap cross, computed once for the three consumers
+  // below instead of twice. owLum is linear, so the chroma blur's owLum( nb ) is
+  // exactly lblur and no longer needs a dot product of its own.
+  float l1 = owLum( n1 ), l2 = owLum( n2 ), l3 = owLum( n3 ), l4 = owLum( n4 );
+  float lc = owLum( centre );
+  float lblur = ( l1 + l2 + l3 + l4 ) * 0.25;
+  float lmn = min( min( l1, l2 ), min( l3, l4 ) );
+  float lmx = max( max( l1, l2 ), max( l3, l4 ) );
+
+  // --- edge-directed reconstruction of the upscale -------------------------
+  // uTexel is ONE SOURCE TEXEL, and composite.render( renderer, null ) writes at
+  // drawing-buffer size, so below renderScale 1 this pass IS the upscaler and the
+  // four taps above are a cross at exactly one source texel around the fractional
+  // source position. The bilinear tent that texture2D applies on the way up
+  // spreads a one-texel step across two, and that smear -- not aliasing -- is
+  // what a scaled frame actually looks like once TAA has band-limited it.
+  //
+  // What this undoes it with: the second derivative IN THE GRADIENT DIRECTION.
+  //   wx      how much of the gradient lies along x, from EASU's two-texel first
+  //           differences. 1 on a vertical edge, 0 on a horizontal one, 0.5 when
+  //           there is no gradient to speak of (the +1e-12 pair makes that case
+  //           land exactly on 0.5 instead of on 0/0).
+  //   lAcross the neighbour pair that CROSSES the edge. lc - lAcross is minus
+  //           half the second derivative along that direction, which is zero on
+  //           the linear middle of a ramp and non-zero exactly at the two knees
+  //           the tent rounded off. Undoing it there and only there compresses a
+  //           two-texel edge back to one.
+  //
+  // THE CLAMP IS NOT A SAFETY RAIL, IT IS THE FILTER. Without it this is a plain
+  // unsharp mask and it overshoots a step by +/-50%: on the measured frame,
+  // dropping the clamp costs more than the whole filter gains, three times over
+  // (SSIM 0.9577 -> 0.8987, against 0.9488 for bilinear). Clamping the TARGET
+  // LUMINANCE to the tap cross is the same anti-ringing bound FSR's RCAS applies
+  // through its lobe limit, and it is what turns a sharpen into a deconvolution.
+  //
+  // A LUMINANCE GAIN, for the reason the sharpen below is one: a scalar multiple
+  // of the centre colour cannot invent chroma. It measured identically to the
+  // per-channel form (SSIM 0.95777 rgb vs 0.95773 luma at 0.72), so the form that
+  // cannot reintroduce the fringing bug wins for free.
+  //
+  // MEASURED with cod upsim, against a 9x supersampled reference. SSIM, bilinear
+  // -> this, at 512x332:
+  //   0.95 0.96507 -> 0.96857   0.85 0.95959 -> 0.96561   0.72 0.94883 -> 0.95777
+  //   0.90 0.96193 -> 0.96656   0.80 0.95571 -> 0.96212   0.65 0.93961 -> 0.95009
+  // and it runs BEFORE the chroma clean-up because that is where it was measured.
+  //
+  // WHERE IT LOSES, which is why reconStrength() gates it: on a source TAA has
+  // not band-limited -- a 1-spp aliased frame -- sharpening amplifies the
+  // staircase and costs 0.005 SSIM. That case is the no-TAA path, and there the
+  // fxaa pass is non-null, the composite writes to ldrRt at internal size, FXAA
+  // does the upscale and uRecon is 0. The filter is on exactly where it wins.
+  if ( uRecon > 0.0 ) {
+    float dx = l1 - l2, dy = l3 - l4;
+    float gx = dx * dx, gy = dy * dy;
+    float wx = ( gx + 1e-12 ) / ( gx + gy + 2e-12 );
+    float lAcross = mix( ( l3 + l4 ) * 0.5, ( l1 + l2 ) * 0.5, wx );
+    float lt = clamp( lc + ( lc - lAcross ) * uRecon, min( lc, lmn ), max( lc, lmx ) );
+    hdr *= lt / max( lc, 1e-4 );
+  }
 
   // --- chroma clean-up in the darks ---------------------------------------
   // A 4-tap CHROMA-only blur, applied only in the bottom three stops and
@@ -77,9 +172,8 @@ void main() {
   {
     vec3 nb = ( n1 + n2 + n3 + n4 ) * 0.25;
     float lh = owLum( hdr );
-    float ln = owLum( nb );
     float w = ( 1.0 - smoothstep( 0.003, 0.030, lh ) ) * 0.60;
-    if ( w > 0.005 && ln > 1e-6 ) hdr = mix( hdr, nb * ( lh / ln ), w );
+    if ( w > 0.005 && lblur > 1e-6 ) hdr = mix( hdr, nb * ( lh / lblur ), w );
   }
 
   // --- sharpen (contrast adaptive, only where TAA softened things) ---------
@@ -90,11 +184,6 @@ void main() {
   // magenta/green fringing on every high-contrast edge came from. A scalar gain
   // around the centre luminance cannot invent chroma at all.
   if ( uGrade.z > 0.001 ) {
-    float l1 = owLum( n1 ), l2 = owLum( n2 ), l3 = owLum( n3 ), l4 = owLum( n4 );
-    float lc = owLum( centre );
-    float lmn = min( min( l1, l2 ), min( l3, l4 ) );
-    float lmx = max( max( l1, l2 ), max( l3, l4 ) );
-    float lblur = ( l1 + l2 + l3 + l4 ) * 0.25;
     // contrast adaptive: less sharpening where local contrast is already high
     float contrast = ( lmx - lmn ) / ( lmx + lmn + 0.02 );
     float amount = uGrade.z * ( 1.0 - clamp( contrast * 1.6, 0.0, 1.0 ) );
@@ -104,7 +193,7 @@ void main() {
     hdr *= clamp( gain, 0.0, 4.0 );
   }
 
-  hdr *= exposure;
+  hdr *= vExposure;
 
   // --- bloom (already exposure-scaled AND thresholded in the prefilter) ----
   // ADDED, not mixed. mix() with an unthresholded pyramid is veiling glare: it
@@ -240,6 +329,7 @@ ${COMMON}
 uniform sampler2D tColor;
 uniform sampler2D tView;
 uniform vec2 uTexel;
+uniform vec4 uViewRect;   // x0 y0 x1 y1 in UV, padded by the filter reach
 varying vec2 vUv;
 
 vec4 fetchView( vec2 uv ) { return max( texture2D( tView, uv ), vec4( 0.0 ) ); }
@@ -249,6 +339,43 @@ float edgeLuma( vec4 c ) { return owLum( c.rgb ) + c.a; }
 
 void main() {
   vec3 world = texture2D( tColor, vUv ).rgb;
+
+  // Outside the weapon this pass is an expensive copy, and skipping it there is
+  // provably free rather than approximately free. The viewmodel target is
+  // cleared to vec4( 0 ), so on a pixel whose whole five-tap neighbourhood is
+  // empty every edgeLuma is 0, lmax - lmin is 0, the edge test cannot fire, v
+  // stays at the centre tap, alpha is 0, and the last line below already
+  // reduces to plain world. This returns the same bits, not a similar colour.
+  //
+  // It also means the rectangle only has to clear the DIAGONAL taps by its
+  // reach: the +/-3 texel arm further down is inside the branch, and the branch
+  // cannot be entered from a neighbourhood that is empty. One texel of taps plus
+  // one of coverage quantisation is 2, and _viewScreenRect pads by 6.
+  //
+  // Worth 6.86 M fetches per frame at 2268x1473 averaged over the walk/fire/
+  // ADS/reload/melee/swap script, and 9.02 M on the frame cod fill prices, which
+  // sits near the script's median. The rectangle covers 0.5895 of the screen on
+  // average against a measured ceiling -- the exact near-clipped footprint of
+  // every triangle the weapon draws -- of 0.4856, so it collects 80% of
+  // everything a perfect bound could. The weapon is much bigger on screen than
+  // it looks: 45% at the median and 73% at p90, not the 15% it reads as.
+  //
+  // fillsim.mjs prices this by PARSING the branch below and then calling the
+  // shipped _viewScreenRect on the measured frame, so deleting either one moves
+  // the model instead of leaving it quoting a rectangle that is gone.
+  //
+  // THE FIRST VERSION OF THIS WAS DELETED, and the reason is worth keeping. It
+  // unioned bounding SPHERES and collapsed to the whole screen on 140 frames of
+  // 140, because the buttstock passes through the eye and a sphere touching the
+  // near plane has no bounded perspective image. That was read as "no bound
+  // exists here"; it was a fact about spheres. The bounding sphere of a rifle
+  // has the radius of the rifle's length. See _viewScreenRect in render/index.js
+  // for the box that replaced it and for why clipping it stays conservative.
+  if ( vUv.x < uViewRect.x || vUv.x > uViewRect.z
+    || vUv.y < uViewRect.y || vUv.y > uViewRect.w ) {
+    gl_FragColor = vec4( world, 1.0 );
+    return;
+  }
 
   vec4 m = fetchView( vUv );
   vec4 nw = fetchView( vUv + vec2( -1.0, -1.0 ) * uTexel );
@@ -292,6 +419,10 @@ export function createViewComposite() {
     tColor: { value: null },
     tView: { value: null },
     uTexel: { value: new THREE.Vector2() },
+    // Whole screen until the first frame sets it, so a preset or a code path
+    // that never calls _viewScreenRect degrades to the old unconditional pass
+    // rather than to an invisible weapon.
+    uViewRect: { value: new THREE.Vector4(0, 0, 1, 1) },
   });
 }
 
@@ -321,6 +452,32 @@ export function createDebug() {
   });
 }
 
+/**
+ * How hard to run the edge-directed reconstruction, given how far the frame is
+ * being stretched.
+ *
+ * `cod upsim --mode=kappa` swept the strength at seven render scales against a
+ * supersampled reference. The optimum drifts only gently with the stretch —
+ * ~0.5 at 1.05x, ~0.7 at 1.11x, ~1.0 at 1.39x, ~1.3 at 1.54x — and the curve is
+ * so flat near its peak that every one of those points scores within 0.0004 SSIM
+ * of the best under a single constant. So this is not a ramp with a slope, it is
+ * a switch with a soft edge: off at native, fully on once the stretch is past
+ * about 12%.
+ *
+ * It has to be exactly 0 at native. The filter undoes a bilinear tent, and at
+ * 1:1 there is no tent to undo — `texture2D` lands on texel centres and returns
+ * the texel. Anything above 0 there is a sharpen nobody asked for, on top of the
+ * contrast-adaptive one this pass already runs.
+ *
+ * `adaptiveResolution` moves renderScale at runtime and resize() re-runs this,
+ * so the filter fades in as the scaler drops rather than popping on.
+ */
+export function reconStrength(displayWidth, internalWidth) {
+  if (!(internalWidth > 0) || !(displayWidth > internalWidth)) return 0;
+  const t = Math.min(1, Math.max(0, (displayWidth / internalWidth - 1.0) / 0.12));
+  return t * t * (3 - 2 * t);
+}
+
 export function createComposite(lut) {
   return new Pass('ow-composite', COMPOSITE, {
     tColor: { value: null },
@@ -329,6 +486,7 @@ export function createComposite(lut) {
     tLut: { value: lut.texture },
     uTexel: { value: new THREE.Vector2() },
     uResolution: { value: new THREE.Vector2() },
+    uRecon: { value: 0 },
     uLens: { value: new THREE.Vector4(0.0016, 0.24, 0.010, 0) },
     uGrade: { value: new THREE.Vector4(0.05, 0.85, 0.22, lut.size) },
     // slope / power / saturation of the AgX look, applied to the LOG-NORMALISED
@@ -342,7 +500,7 @@ export function createComposite(lut) {
     // Together with a contrast pivot below mid-grey it is what put 18% scene
     // grey on code value 153.
     uLook: { value: new THREE.Vector4(1.0, 1.0, 1.08, 1) },
-  });
+  }, { vertexShader: COMPOSITE_VERT });
 }
 
 export function createFxaa() {

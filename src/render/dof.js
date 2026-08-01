@@ -30,19 +30,65 @@ import { Pass, hdrTarget } from './pass.js';
  * hands are untouched and stay pin sharp for free.
  */
 
+/**
+ * The focal distance, hoisted to the three vertices of the full-screen triangle.
+ *
+ * It is one texel at the screen centre and the same texel for every pixel of the
+ * draw, so reading it per fragment was a texture instruction per pixel to fetch
+ * a number the whole frame shares. PREFILTER and COMBINE each paid it once per
+ * fragment; both now take it as a `flat` varying, which is bit-identical rather
+ * than merely equal because the provoking vertex's value arrives uninterpolated.
+ * (`flat` is legal despite the ESSL 1.00 spellings around it -- see Pass in
+ * pass.js for why every ShaderMaterial here compiles as `#version 300 es`.)
+ *
+ * The vec2( 0.5 ) sample point is deliberate and survives the move unchanged.
+ * On a LinearFilter target of even width it lands at texel coordinate w/2 - 0.5,
+ * i.e. exactly on the boundary between two texels, so the fetch returns their
+ * mean with weight 0.5 each and nothing snaps it back. Where the reticle crosses
+ * a silhouette that mean is the harmonic mean of the two depths -- a 3 m
+ * foreground against a 100 m background focuses at 5.8 m, a plane no surface is
+ * on, and it moves continuously as the player sweeps the aim across the edge.
+ * NearestFilter picks one of the two surfaces and snaps once. A focal plane that
+ * hunts through empty space is worse than one that picks a side, so this keeps
+ * the point sample.
+ *
+ * Vertex-stage sampling is level 0 with no implicit derivative, which is what
+ * this fetch already was: the depth target has no mips.
+ */
+const FOCUS_VERT = /* glsl */ `
+uniform sampler2D tDepth;
+uniform vec4 uFocus;
+varying vec2 vUv;
+flat out float vFocus;
+void main() {
+  vUv = position.xy * 0.5 + 0.5;
+  float c = texture2D( tDepth, vec2( 0.5 ) ).r;
+  if ( c <= 0.0 ) c = 1e4;                       // aiming at the sky
+  vFocus = clamp( c, uFocus.z, uFocus.w );
+  gl_Position = vec4( position.xy, 0.0, 1.0 );
+}
+`;
+
 // Shared CoC evaluation. Depth is POSITIVE linear metres; the prepass clears to
 // zero, so 0 means "sky" and takes the far blur outright.
+//
+// `tDepth` is NOT declared here: the focal read moved to FOCUS_VERT, and the
+// only other reader is the !depthInAlpha arm of the two templates below, which
+// declares it itself. A stage that does not fetch it should not name it.
 const COC = /* glsl */ `
-uniform sampler2D tDepth;
 // x maxCoC(px)  y nearRatio  z focusMin  w focusMax
 uniform vec4 uFocus;
 // x farStartScale  y farRange  z nearScale  w unused
 uniform vec4 uRange;
+flat in float vFocus;
 
-float owFocusDistance() {
-  float c = texture2D( tDepth, vec2( 0.5 ) ).r;
-  if ( c <= 0.0 ) c = 1e4;                       // aiming at the sky
-  return clamp( c, uFocus.z, uFocus.w );
+// View depth back out of the colour target's alpha, where the TAA resolve
+// parked 1 / viewDepth and motion blur passed it through untouched. Sky is
+// exactly 0 there by construction, which is the same "no geometry" flag depth
+// 0 is in the gbuffer, so it lands on owCoC's own sky case below instead of
+// dividing by zero. No fetch: the caller already has the texel in hand.
+float owDepthFromAlpha( float a ) {
+  return a > 0.0 ? 1.0 / a : 0.0;
 }
 
 float owCoC( float depth, float focus ) {
@@ -55,27 +101,59 @@ float owCoC( float depth, float focus ) {
 }
 `;
 
-const PREFILTER = /* glsl */ `
+/**
+ * @param depthInAlpha  true when tColor carries 1 / viewDepth in its alpha,
+ *   which is the case whenever the TAA resolve is in the chain (motion blur
+ *   forwards the channel untouched, and nothing else runs between them).
+ *
+ * TWO SOURCES RATHER THAN ONE WITH A #define, deliberately: fragcost counts
+ * fetch call sites in the string it is handed, so a single source carrying
+ * both arms would be priced as if it took every fetch of both. The same
+ * arrangement, for the same reason, as BLUR in motionblur.js.
+ *
+ * THE FOUR TAPS LAND ON EXACT FULL-RES TEXEL CENTRES, which is what makes the
+ * alpha read the same number the tDepth fetch was returning rather than merely
+ * a close one. A half-res fragment j has vUv = ( j + 0.5 ) / ( w / 2 ), i.e.
+ * full-res coordinate 2j + 1, and the offsets are +-0.5 of a full-res texel,
+ * so the taps sit at 2j + 0.5 and 2j + 1.5 -- the centres of texels 2j and
+ * 2j + 1. Where the axis is odd -- 1473 at ultra, halved to 736 -- the mapping
+ * drifts by at most 7e-4 of a texel, which is below the 1/16 an ES 3.0 sampler
+ * is allowed to quantise its sub-texel weight to and far below the 1/256
+ * desktop parts actually use, so the bilinear weight snaps to exactly 1 and
+ * the tap is still a point sample.
+ */
+const PREFILTER = (depthInAlpha) => /* glsl */ `
 precision highp float;
 ${COMMON}
 ${COC}
 uniform sampler2D tColor;
+${depthInAlpha ? '' : 'uniform sampler2D tDepth;'}
 uniform vec2 uSrcTexel;
 varying vec2 vUv;
 
 void main() {
-  float focus = owFocusDistance();
+  float focus = vFocus;
 
   vec2 o = uSrcTexel * 0.5;
-  vec3 c0 = max( texture2D( tColor, vUv + vec2( -o.x, -o.y ) ).rgb, vec3( 0.0 ) );
-  vec3 c1 = max( texture2D( tColor, vUv + vec2(  o.x, -o.y ) ).rgb, vec3( 0.0 ) );
-  vec3 c2 = max( texture2D( tColor, vUv + vec2( -o.x,  o.y ) ).rgb, vec3( 0.0 ) );
-  vec3 c3 = max( texture2D( tColor, vUv + vec2(  o.x,  o.y ) ).rgb, vec3( 0.0 ) );
+  vec4 t0 = texture2D( tColor, vUv + vec2( -o.x, -o.y ) );
+  vec4 t1 = texture2D( tColor, vUv + vec2(  o.x, -o.y ) );
+  vec4 t2 = texture2D( tColor, vUv + vec2( -o.x,  o.y ) );
+  vec4 t3 = texture2D( tColor, vUv + vec2(  o.x,  o.y ) );
 
-  float d0 = texture2D( tDepth, vUv + vec2( -o.x, -o.y ) ).r;
+  vec3 c0 = max( t0.rgb, vec3( 0.0 ) );
+  vec3 c1 = max( t1.rgb, vec3( 0.0 ) );
+  vec3 c2 = max( t2.rgb, vec3( 0.0 ) );
+  vec3 c3 = max( t3.rgb, vec3( 0.0 ) );
+
+  ${depthInAlpha
+    ? `float d0 = owDepthFromAlpha( t0.a );
+  float d1 = owDepthFromAlpha( t1.a );
+  float d2 = owDepthFromAlpha( t2.a );
+  float d3 = owDepthFromAlpha( t3.a );`
+    : `float d0 = texture2D( tDepth, vUv + vec2( -o.x, -o.y ) ).r;
   float d1 = texture2D( tDepth, vUv + vec2(  o.x, -o.y ) ).r;
   float d2 = texture2D( tDepth, vUv + vec2( -o.x,  o.y ) ).r;
-  float d3 = texture2D( tDepth, vUv + vec2(  o.x,  o.y ) ).r;
+  float d3 = texture2D( tDepth, vUv + vec2(  o.x,  o.y ) ).r;`}
 
   // Weight the colour toward the MORE blurred taps: averaging a sharp
   // background into a blurred foreground is what makes cheap DOF look like a
@@ -131,51 +209,79 @@ void main() {
 }
 `;
 
-const COMBINE = /* glsl */ `
+/** @param depthInAlpha  as PREFILTER above. Here vUv is a full-res texel
+ *  centre outright, so the alpha read is the same texel the tDepth fetch was
+ *  returning with no offset argument to make at all. */
+const COMBINE = (depthInAlpha) => /* glsl */ `
 precision highp float;
 ${COMMON}
 ${COC}
 uniform sampler2D tColor;
 uniform sampler2D tBlur;
+${depthInAlpha ? '' : 'uniform sampler2D tDepth;'}
 varying vec2 vUv;
 
 void main() {
-  vec3 sharp = max( texture2D( tColor, vUv ).rgb, vec3( 0.0 ) );
+  vec4 src = texture2D( tColor, vUv );
+  vec3 sharp = max( src.rgb, vec3( 0.0 ) );
   vec4 blur = texture2D( tBlur, vUv );
-  float focus = owFocusDistance();
-  float coc = owCoC( texture2D( tDepth, vUv ).r, focus );
+  float focus = vFocus;
+  float coc = owCoC( ${depthInAlpha
+    ? 'owDepthFromAlpha( src.a )'
+    : 'texture2D( tDepth, vUv ).r'}, focus );
   // Dilate with the gathered neighbourhood maximum so a blurred foreground
   // actually bleeds over the sharp thing behind it.
   coc = max( coc, blur.a * 0.85 );
   float m = smoothstep( 0.35, 1.45, coc );
+  // THIS IS WHERE THE 1 / viewDepth ALPHA CHAIN ENDS, and it ends CONDITIONALLY
+  // -- the pass only runs while the sights are up. Every registered pass after
+  // this one therefore sees 1 / d in its colour input's alpha in hipfire and a
+  // constant 1.0 in ADS. Nothing downstream reads it today (sky-vol-composite
+  // takes its centre depth from tDepth on purpose, ow-view-composite's alpha
+  // reads are all on tView), and nothing downstream may start: a pass that
+  // took the cheap channel would be correct until the player aimed, which is
+  // the worst shape a bug can have. Reconstructing 1 / d here instead of
+  // writing 1.0 is not the fix either -- the blurred colour is a mix of many
+  // depths and the alpha would be a number no pixel has.
   gl_FragColor = vec4( mix( sharp, max( blur.rgb, vec3( 0.0 ) ), m ), 1.0 );
 }
 `;
 
 export class DepthOfField {
-  constructor() {
+  /**
+   * @param depthInAlpha  true when the colour handed to render() carries
+   *   1 / viewDepth in its alpha. That is exactly "the TAA resolve is on",
+   *   because TAA is the only pass that publishes the channel and motion blur
+   *   -- the only thing that can sit between it and here -- forwards centre.a
+   *   unchanged on both of its exits. Passed as the flag rather than read off
+   *   the preset name because `--qset dof=true,taa=false` is reachable from
+   *   the capture harness, and there the alpha is surface opacity: every
+   *   circle of confusion in the frame would be computed at a depth of 1 m.
+   */
+  constructor(depthInAlpha = false) {
+    this.depthInAlpha = !!depthInAlpha;
     const focus = new THREE.Vector4(5.0, 0.6, 3.0, 20.0);
     const range = new THREE.Vector4(1.2, 20.0, 0.55, 0);
 
-    this.pre = new Pass('ow-dof-pre', PREFILTER, {
+    this.pre = new Pass('ow-dof-pre', PREFILTER(this.depthInAlpha), {
       tColor: { value: null },
       tDepth: { value: null },
       uSrcTexel: { value: new THREE.Vector2() },
       uFocus: { value: focus },
       uRange: { value: range },
-    });
+    }, { vertexShader: FOCUS_VERT });
     this.gather = new Pass('ow-dof-gather', GATHER, {
       tSrc: { value: null },
       uTexel: { value: new THREE.Vector2() },
       uParams: { value: new THREE.Vector2(5.0, 0) },
     });
-    this.combine = new Pass('ow-dof-combine', COMBINE, {
+    this.combine = new Pass('ow-dof-combine', COMBINE(this.depthInAlpha), {
       tColor: { value: null },
       tBlur: { value: null },
       tDepth: { value: null },
       uFocus: { value: focus },
       uRange: { value: range },
-    });
+    }, { vertexShader: FOCUS_VERT });
 
     // One Vector4 shared by prefilter and combine so the focal plane can never
     // disagree between the two.

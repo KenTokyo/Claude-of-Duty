@@ -36,8 +36,14 @@ void main() {
   vec3 N = owDecodeNormal( nrm.xy );
   vec3 L = uSunDirView;
 
+  // A pixel whose surface is turned away from the sun receives no sun term to
+  // shadow, so the march is skipped -- and the NEGATED depth marks it for the
+  // bilateral below, which would otherwise blur 30% of the frame to produce a
+  // value nothing multiplies by anything. RG16F carries the sign for free, the
+  // blur takes abs() everywhere it compares depths, and the only reader outside
+  // this file (materialpatch.js, owContactShadow) takes .r and never .g.
   float NdL = dot( N, L );
-  if ( NdL <= 0.02 ) { gl_FragColor = vec4( 1.0, depth, 0.0, 1.0 ); return; }
+  if ( NdL <= 0.02 ) { gl_FragColor = vec4( 1.0, -depth, 0.0, 1.0 ); return; }
 
   float len = uParams.x * clamp( depth * 0.08 + 0.75, 0.75, 2.5 );
   float jitter = owIGN( gl_FragCoord.xy + uParams.z * 3.1717 );
@@ -52,9 +58,11 @@ void main() {
     vec2 suv = clip.xy / clip.w * 0.5 + 0.5;
     if ( suv.x <= 0.0 || suv.x >= 1.0 || suv.y <= 0.0 || suv.y >= 1.0 ) break;
 
+    // A depth of 0 is the prepass's "no geometry" clear (see prepass.js), so
+    // this is the old normal.z < 0.5 coverage test for one fetch instead of
+    // two.
     float sceneDepth = texture2D( tDepth, suv ).r;
-    float cov = texture2D( tNormal, suv ).z;
-    if ( cov < 0.5 ) continue;
+    if ( sceneDepth <= 0.0 ) continue;
 
     float diff = -sp.z - sceneDepth;
     float bias = 0.004 + sceneDepth * 0.0025;
@@ -75,9 +83,47 @@ const BILATERAL = /* glsl */ `
 precision highp float;
 uniform sampler2D tSrc;
 uniform vec2 uDirection;
+uniform float uFinal;   // 1.0 on the second (vertical) direction, 0.0 on the first
 varying vec2 vUv;
 void main() {
   vec2 c = texture2D( tSrc, vUv ).rg;
+
+  // Sky carries the 1e4 depth sentinel the contact pass writes for uncovered
+  // pixels, and it is 41% of the frame at full resolution across BOTH blur
+  // directions. Running the four side taps there computes a value that is
+  // already known: every neighbour weight is exp( -|a.g - 1e4| * 40.0 / 1e4 ),
+  // which is exp( -40 ) or smaller for any real depth, so a sky pixel resolves
+  // to its own r -- 1.0, the pass's no-occlusion value -- to within 1e-17.
+  // Nothing downstream reads it in any case: the term is multiplied onto the
+  // sun contribution inside the material, and sky has none. The .g sentinel is
+  // forwarded unchanged so the second direction sees the same mask.
+  if ( c.g >= 1.0e4 ) { gl_FragColor = vec4( c.r, c.g, 0.0, 1.0 ); return; }
+
+  // A NEGATIVE depth is the contact pass's "this surface is turned away from
+  // the sun" mark (N.L <= 0.02, see above). 30.2% of this frame is such pixels
+  // -- measured, not assumed: "cod fwd" reports backfacingPctOfScreen off the
+  // same normals the G-buffer holds, and shadowsim independently puts 51.3% of
+  // covered pixels there.
+  //
+  // ONLY THE SECOND DIRECTION MAY SKIP THEM, and the asymmetry is the whole
+  // design. This pass's output is read by exactly one thing, owContactShadow in
+  // materialpatch.js, multiplied onto a sun term those pixels do not have; the
+  // FIRST direction's output, by contrast, is read again here, by the
+  // front-facing neighbours two texels above and below. Skipping the horizontal
+  // pass as well would save twice as much and would change the value those
+  // neighbours read -- taking real occlusion off lit geometry, which is a
+  // visible loss rather than an invisible one.
+  //
+  // The precedent is already in the frame: csm.js:579 returns 1.0 at NdL <= 0
+  // and this file returns 1.0 at NdL <= 0.02, so a geometrically sun-averted
+  // pixel is ALREADY treated as unshadowed everywhere except in this blur.
+  if ( uFinal > 0.5 && c.g < 0.0 ) { gl_FragColor = vec4( c.r, c.g, 0.0, 1.0 ); return; }
+
+  // abs() on every depth read, so a marked neighbour still weighs exactly what
+  // it weighed before the mark existed. Both directions are therefore bit-
+  // identical to the unmarked version on every pixel they still process:
+  // abs() of a positive float is that float, and abs(-d) is d.
+  float cg = max( 0.1, abs( c.g ) );
   float sum = c.r * 0.5;
   float wsum = 0.5;
   for ( int i = 1; i <= 2; i ++ ) {
@@ -85,8 +131,8 @@ void main() {
     vec2 a = texture2D( tSrc, vUv + o ).rg;
     vec2 b = texture2D( tSrc, vUv - o ).rg;
     float w = 0.3 / float( i );
-    float wa = w * exp( -abs( a.g - c.g ) * 40.0 / max( 0.1, c.g ) );
-    float wb = w * exp( -abs( b.g - c.g ) * 40.0 / max( 0.1, c.g ) );
+    float wa = w * exp( -abs( abs( a.g ) - abs( c.g ) ) * 40.0 / cg );
+    float wb = w * exp( -abs( abs( b.g ) - abs( c.g ) ) * 40.0 / cg );
     sum += a.r * wa + b.r * wb;
     wsum += wa + wb;
   }
@@ -112,6 +158,10 @@ export class ContactShadows {
     this.blur = new Pass('ow-contact-blur', BILATERAL, {
       tSrc: { value: null },
       uDirection: { value: new THREE.Vector2() },
+      // An explicit flag rather than `uDirection.x == 0.0`. The horizontal pass
+      // happens to be the one with a zero y today, so the implicit test would
+      // work and would break silently the day the order is swapped.
+      uFinal: { value: 0 },
     });
     this.rtA = null;
     this.rtB = null;
@@ -128,13 +178,23 @@ export class ContactShadows {
     this.pass.uniforms.uParams.value.w = s;
   }
 
-  setSize(w, h) {
+  /**
+   * @param blurScale  multiplier on the blur's tap spacing, in units of this
+   *   target's own texel. Below 1x resolution the bilateral would otherwise
+   *   widen with the texel — a half-res buffer blurring +/-2 of ITS texels
+   *   reaches +/-4 screen pixels, and a contact shadow is only a few pixels
+   *   wide to begin with, so it would dissolve the very band this pass exists
+   *   to resolve. Passing the resolution scale here keeps the blur's footprint
+   *   fixed in SCREEN space at any resolution; the sub-texel offsets that
+   *   produces are exact, the targets are LinearFilter.
+   */
+  setSize(w, h, blurScale = 1) {
     this.rtA?.dispose();
     this.rtB?.dispose();
     const o = { type: THREE.HalfFloatType, format: THREE.RGFormat, name: 'contact' };
     this.rtA = hdrTarget(w, h, o);
     this.rtB = hdrTarget(w, h, o);
-    this._texel = new THREE.Vector2(1 / w, 1 / h);
+    this._texel = new THREE.Vector2(blurScale / w, blurScale / h);
   }
 
   render(renderer, gbuffer, camera, sunDirView, frame) {
@@ -150,9 +210,12 @@ export class ContactShadows {
     const b = this.blur.uniforms;
     b.tSrc.value = this.rtA.texture;
     b.uDirection.value.set(this._texel.x, 0);
+    b.uFinal.value = 0;
     this.blur.render(renderer, this.rtB);
     b.tSrc.value = this.rtB.texture;
     b.uDirection.value.set(0, this._texel.y);
+    // Only this direction may drop the sun-averted pixels; see BILATERAL.
+    b.uFinal.value = 1;
     this.blur.render(renderer, this.rtA);
 
     this.texture = this.rtA.texture;

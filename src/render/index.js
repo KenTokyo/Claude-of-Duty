@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { hdrTarget, blit } from './pass.js';
 import { CascadedShadowMaps } from './csm.js';
 import { MaterialPatcher } from './materialpatch.js';
-import { GBuffer } from './prepass.js';
+import { GBuffer, canPrepassAlphaTest } from './prepass.js';
 import { Gtao } from './gtao.js';
 import { ContactShadows } from './contact.js';
 import { Ssr } from './ssr.js';
@@ -13,10 +13,11 @@ import { DepthOfField } from './dof.js';
 import { Bloom } from './bloom.js';
 import { AutoExposure } from './exposure.js';
 import { createGradeLut } from './lut.js';
-import { createComposite, createFxaa, createDebug, createViewComposite } from './composite.js';
+import { createComposite, createFxaa, createDebug, createViewComposite, reconStrength } from './composite.js';
 import { buildFallbackEnvironment } from './env.js';
 import { RenderProbeScene } from './probe.js';
 import { AdaptiveResolution, GpuFrameTimer } from './adaptive.js';
+import { OverrideBatcher } from './overridebatch.js';
 
 const QUALITY_LEVEL = { low: 0, medium: 1, high: 2, ultra: 3 };
 
@@ -77,7 +78,12 @@ const REF_DAYLIGHT = 4.6;
  *   r.normalTexture           RGBA16F oct-encoded VIEW normal (xy), coverage (z:
  *                             1 = static geometry, 0.7 = skinned/morphed, 0 =
  *                             nothing; test against 0.5 for "is there a
- *                             surface"), material id (w)
+ *                             surface"), ONE OVER view depth (w: 0 = nothing).
+ *                             The reciprocal is there so TAA can answer "which
+ *                             neighbour is nearest" and "is it covered" with one
+ *                             fetch instead of two; see prepass.js. It is a half,
+ *                             so read depthTexture instead wherever metres are
+ *                             wanted to better than about 0.05%.
  *   r.aoTexture               R16F GTAO visibility, or null
  *   r.exposureTexture         1x1 float, .r = exposure scalar, .g = EV100
  *   r.hdrTexture              the pre-post HDR colour target
@@ -119,8 +125,14 @@ const REF_DAYLIGHT = 4.6;
  * Per-object opt-outs, set on the Object3D:
  *   userData.owNoPrepass = true   keep out of depth/normal/velocity (particles)
  *   userData.owNoShadow  = true   do not cast into the cascades
- *   userData.owMatId     = 0..1   written to the gbuffer alpha for custom fx
  * Transparent materials are excluded from the prepass and shadows automatically.
+ *
+ * userData.owMatId is GONE. It was a per-object float written to the gbuffer
+ * normal's alpha for "custom fx"; nothing in the project ever set it and no
+ * shader ever read it, so the channel held a constant 0 on every pixel of every
+ * frame. TAA now publishes 1/depth there and saves two full-resolution fetches
+ * for it. Anything that needs a per-object id again wants its own attachment,
+ * not this one.
  */
 export class RenderSystem {
   static id = 'render';
@@ -192,6 +204,7 @@ export class RenderSystem {
       enabled: adaptiveEnabled,
     });
     this._gpuSequence = 0;
+    this._lastRenderAt = 0;
     // A timer query enclosing first-use compilation can reset ANGLE/D3D11 on
     // affected drivers. Frame pacing drives bootstrap scaling until programs
     // have been exercised, then the non-blocking GPU timer takes over.
@@ -202,6 +215,9 @@ export class RenderSystem {
       targetFps,
       scale: this.renderScale,
       gpuMs: 0,
+      gpuMsUsed: 0,
+      gpuClamped: 0,
+      frameMs: 0,
       p50: 0,
       p90: 0,
       changes: 0,
@@ -242,14 +258,34 @@ export class RenderSystem {
     });
 
     this.gbuffer = new GBuffer();
+    // Collapses multi-material meshes to one draw for the two passes that
+    // override the material anyway. See overridebatch.js. A null batcher is the
+    // off switch, so the call sites stay a plain optional-chain rather than
+    // growing a second branch around each try/finally.
+    this.overrideBatcher = q.overrideBatch === false ? null : new OverrideBatcher();
+    // Ablation switch for the `castShadow` fix in `_visit`. Kept as a quality
+    // key so `--qset=shadowCastFlag=false` restores the old behaviour for an
+    // A/B without a rebuild, the same deal `overrideBatch` and
+    // `prepassDepthReuse` already offer.
+    this._shadowCastFlag = q.shadowCastFlag !== false;
     this.gtao = q.gtao ? new Gtao() : null;
+    this._aoScale = Math.min(1, Math.max(0.25, q.aoScale ?? 1));
     this.contact = this.qLevel >= 1 ? new ContactShadows() : null;
+    this._contactScale = Math.min(1, Math.max(0.25, q.contactScale ?? 1));
     this.ssr = q.ssr ? new Ssr() : null;
     this.taa = q.taa ? new Taa() : null;
-    this.motionBlur = q.motionBlur ? new MotionBlur() : null;
+    // The flag is the TAA setting, not the quality name: motion blur reads the
+    // view depth out of its colour input's alpha, and only the TAA resolve
+    // publishes it there. Every shipping preset that enables one enables the
+    // other, but `--qset motionBlur=true,taa=false` is reachable from the
+    // capture harness and would otherwise weight the blur off surface opacity.
+    this.motionBlur = q.motionBlur ? new MotionBlur(!!this.taa) : null;
     // ADS depth of field. Cheap (half-res gather, 32 taps) and only ever runs
     // while the sights are actually up, so it costs nothing in hipfire.
-    this.dof = this.qLevel >= 1 ? new DepthOfField() : null;
+    // Same flag and the same reason as motion blur above: the prefilter and the
+    // combine take their circle-of-confusion depth out of the colour input's
+    // alpha, and only the TAA resolve puts it there.
+    this.dof = this.qLevel >= 1 ? new DepthOfField(!!this.taa) : null;
     this.bloom = q.bloom ? new Bloom(q.bloomLevels ?? (this.qLevel >= 2 ? 6 : 5)) : null;
     this.exposure = new AutoExposure();
     this._exposureInterval = Math.max(1, q.exposureInterval ?? 1);
@@ -262,6 +298,13 @@ export class RenderSystem {
     this.lut = createGradeLut('default');
     this.composite = createComposite(this.lut);
     this.viewComposite = createViewComposite();
+    // Scratch for _viewScreenRect. Allocated once because that method runs
+    // inside traverseVisible over every viewmodel mesh, every frame.
+    this._viewRect = new THREE.Vector4(0, 0, 1, 1);
+    this._viewRectMv = new Float64Array(16);
+    this._viewRectCx = new Float64Array(8);
+    this._viewRectCy = new Float64Array(8);
+    this._viewRectCz = new Float64Array(8);
     this.fxaa = q.taa ? null : createFxaa();
     // The low forward path has no world-space post effect that must exclude the
     // weapon, so it can clear depth and draw the viewmodel directly into HDR —
@@ -281,6 +324,22 @@ export class RenderSystem {
     // Soft particles can operate without depth fading. The low path drops the
     // entire MRT world replay; richer presets retain the public depth contract.
     this.needsPrepass = q.prepass !== false;
+    /**
+     * Let the forward pass inherit the prepass depth buffer instead of clearing
+     * and refilling it.
+     *
+     * MEASURED with `cod.mjs overdraw`: 2.15 opaque fragments reach the shader
+     * per covered pixel, so 53% of the forward pass's shading lands on surfaces
+     * that are then overwritten. Front-to-back sorting cannot recover it — the
+     * ideal per-object ordering only gets to 2.13, because most of the overdraw
+     * is *inside* single meshes (a facade and its own window reveals). Only a
+     * populated depth buffer removes it, and the prepass has already built one.
+     *
+     * Off with the prepass, and off on the direct-viewmodel path, which clears
+     * HDR depth mid-frame to draw the weapon and would wipe the shared texture.
+     */
+    this.reusePrepassDepth =
+      this.needsPrepass && q.prepassDepthReuse !== false && !this.directViewmodel;
 
     this.hdrRt = null;
     this.viewRt = null;
@@ -381,6 +440,9 @@ export class RenderSystem {
     this._nHide = 0;
     this._noShadow = [];
     this._nNoShadow = 0;
+    /** Subset of _draw whose material alpha-cuts; needs the masked prepass. */
+    this._masked = [];
+    this._nMasked = 0;
     this._dirLights = [];
     this._nDirLights = 0;
     this._foreignMeshes = 0;
@@ -754,7 +816,11 @@ export class RenderSystem {
             camera,
             this._currVP.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse),
             this._currVP,
-            true
+            true,
+            // The masked variant is a second program; compile it here on the
+            // loading screen rather than as a hitch on the first frame of play.
+            this._masked,
+            this._nMasked
           );
         }
         this._showList(this._hide, this._nHide);
@@ -977,8 +1043,21 @@ export class RenderSystem {
     this.screenSize.width = rw;
     this.screenSize.height = rh;
 
+    // The gbuffer is sized FIRST because it owns the depth attachment the HDR
+    // target then shares. Sizing it after would hand the HDR target last frame's
+    // depth texture at the wrong resolution.
+    if (this.needsPrepass) this.gbuffer.setSize(rw, rh);
+
     this.hdrRt?.dispose();
-    this.hdrRt = hdrTarget(rw, rh, { depthBuffer: true, name: 'hdr' });
+    this.hdrRt = hdrTarget(rw, rh, {
+      depthBuffer: true,
+      // Same depth attachment as the prepass. The forward pass then starts with
+      // the scene's depths already in place, so early-Z rejects the hidden
+      // fragments -- MEASURED at 53% of them -- before a single one is shaded.
+      // See prepass.js for why they are biased slightly away from the camera.
+      depthTexture: this.reusePrepassDepth ? this.gbuffer.hardwareDepth : null,
+      name: 'hdr',
+    });
     // Rich presets keep a separate MSAA viewmodel target. The low forward path
     // draws it directly after clearing HDR depth and owns no second full-size RT.
     this.viewRt?.dispose();
@@ -1008,9 +1087,17 @@ export class RenderSystem {
       stencilBuffer: false,
     });
 
-    if (this.needsPrepass) this.gbuffer.setSize(rw, rh);
-    this.gtao?.setSize(rw, rh);
-    this.contact?.setSize(rw, rh);
+    // The AO chain runs at its own resolution (see `aoScale` in config.js). It
+    // reads the FULL-res gbuffer at scaled UVs — a sparse sample of the real
+    // depth, not a downsampled copy, so thin geometry still occludes — and is
+    // read back through a normalised UV in materialpatch.js, which bilinearly
+    // upsamples it for free. Exactly how ssr.js has always worked.
+    const aoW = Math.max(1, Math.floor(rw * this._aoScale));
+    const aoH = Math.max(1, Math.floor(rh * this._aoScale));
+    this.gtao?.setSize(aoW, aoH);
+    const csW = Math.max(1, Math.floor(rw * this._contactScale));
+    const csH = Math.max(1, Math.floor(rh * this._contactScale));
+    this.contact?.setSize(csW, csH, this._contactScale);
     this.ssr?.setSize(rw, rh);
     this.taa?.setSize(rw, rh);
     this.motionBlur?.setSize(rw, rh);
@@ -1021,6 +1108,13 @@ export class RenderSystem {
     this.viewComposite.uniforms.uTexel.value.set(1 / rw, 1 / rh);
     this.composite.uniforms.uTexel.value.set(1 / rw, 1 / rh);
     this.composite.uniforms.uResolution.value.set(rw, rh);
+    // The composite is the upscaler -- it writes to the canvas at dw x dh while
+    // sampling tColor at rw x rh -- but ONLY on the TAA path. With TAA off `fxaa`
+    // exists, the composite renders into ldrRt at internal size, and FXAA does
+    // the stretch instead; the reconstruction must be off there, and not only
+    // because it would be reconstructing the wrong ratio. It loses on a source
+    // TAA has not band-limited. See reconStrength in composite.js.
+    this.composite.uniforms.uRecon.value = this.fxaa ? 0 : reconStrength(dw, rw);
     if (this.fxaa) this.fxaa.uniforms.uTexel.value.set(1 / rw, 1 / rh);
 
     this.depthTexture = this.needsPrepass ? this.gbuffer.depthTexture : null;
@@ -1043,25 +1137,58 @@ export class RenderSystem {
     if (o.isMesh === true || o.isPoints === true || o.isSprite === true || o.isLine === true) {
       const mat = o.material;
       let transparent = false;
+      // Alpha-cut geometry (foliage) is opaque as far as sorting goes, but its
+      // silhouette lives in a texture. The prepass has to reproduce that cut or
+      // its depth covers holes the forward pass leaves open — which matters
+      // because the forward pass now inherits that depth buffer.
+      let masked = false;
+      let maskable = true;
       if (Array.isArray(mat)) {
         for (let i = 0; i < mat.length; i++) {
           this.patcher.patch(mat[i]);
           if (mat[i] && mat[i].transparent === true) transparent = true;
+          if (mat[i] && mat[i].alphaTest > 0) {
+            masked = true;
+            if (!canPrepassAlphaTest(mat[i])) maskable = false;
+          }
         }
+        // One override material draws the whole mesh, so it can carry one
+        // material's alpha map and no more.
+        if (masked && mat.length > 1) maskable = false;
       } else if (mat) {
         this.patcher.patch(mat);
         transparent = mat.transparent === true;
+        if (mat.alphaTest > 0) {
+          masked = true;
+          maskable = canPrepassAlphaTest(mat);
+        }
       }
 
       if (o.isMesh !== true) transparent = true;
       if (o.userData.owProbe !== true) this._foreignMeshes++;
 
       const ud = o.userData;
-      if (transparent || ud.owNoPrepass === true) {
+      // An alpha cut the prepass cannot reproduce is kept out of the prepass
+      // entirely rather than approximated. That costs its GTAO and its motion
+      // vectors — the same deal `owNoPrepass` already makes — and it is the
+      // only option that cannot punch a hole in the image.
+      if (transparent || ud.owNoPrepass === true || (masked && !maskable)) {
         this._hide[this._nHide++] = o;
       } else {
         this._draw[this._nDraw++] = o;
-        if (ud.owNoShadow === true) this._noShadow[this._nNoShadow++] = o;
+        if (masked) this._masked[this._nMasked++] = o;
+        // Two opt-outs, not one. `owNoShadow` is this renderer's own flag;
+        // `castShadow` is three's, and nothing in the cascade path consulted it
+        // — that pass drives `renderer.render()` with an override material,
+        // which renders whatever is visible. So content that had already
+        // declared itself a non-caster was rasterised into all four cascades
+        // regardless: MEASURED at ultra, 785 540 triangles per frame across
+        // 4304 instances of pockmarks, litter, cans, small rocks and the dust
+        // skirt where a prop meets the ground — 11.3% of the entire shadow
+        // pass. Honouring the flag is what three's own shadow map does.
+        if (ud.owNoShadow === true || (this._shadowCastFlag && o.castShadow === false)) {
+          this._noShadow[this._nNoShadow++] = o;
+        }
       }
     } else if (o.isDirectionalLight === true) {
       this._dirLights[this._nDirLights++] = o;
@@ -1072,6 +1199,7 @@ export class RenderSystem {
     this._nDraw = 0;
     this._nHide = 0;
     this._nNoShadow = 0;
+    this._nMasked = 0;
     this._nDirLights = 0;
     this._foreignMeshes = 0;
     scene.traverseVisible(this._visit);
@@ -1372,6 +1500,15 @@ export class RenderSystem {
     const dt = Math.min(0.1, Math.max(1 / 480, ctx.time.dt || 1 / 60));
     this.frame++;
 
+    // The controller's ceiling for GPU-timer readings comes from the wall clock,
+    // so it has to be the wall clock: `dt` above is clamped to 100 ms and
+    // `ctx.time.dt` is additionally multiplied by the time scale. Render-to-
+    // render is the frame interval the player actually experiences.
+    const nowMs = performance.now();
+    const wallMs = this._lastRenderAt > 0 ? nowMs - this._lastRenderAt : 0;
+    this._lastRenderAt = nowMs;
+    this.adaptive.observeFrame(wallMs);
+
     // Resolve an older GPU query before opening this frame's query. Query
     // results are consumed once and never waited on.
     const gpuTimer = this.gpuTimer;
@@ -1381,7 +1518,7 @@ export class RenderSystem {
     if (gpuReady) {
       if (gpuTimer.sequence !== this._gpuSequence) {
         this._gpuSequence = gpuTimer.sequence;
-        scale = this.adaptive.sample(gpuTimer.value, 'gpu');
+        scale = this.adaptive.sampleGpu(gpuTimer.value);
       }
     } else if (this.adaptive.enabled) {
       scale = this.adaptive.sample(dt * 1000, 'frame');
@@ -1398,6 +1535,12 @@ export class RenderSystem {
     perf.scale = this.renderScale;
     perf.timer = gpuReady ? 'gpu' : this.adaptive.enabled ? 'frame' : 'off';
     perf.gpuMs = gpuReady ? gpuTimer.value : 0;
+    // What the controller was actually fed, and how often the driver's number
+    // had to be held down to it. A rising `gpuClamped` on real hardware is the
+    // signature of the inflated-timer bug, not of a slow frame.
+    perf.gpuMsUsed = gpuReady ? this.adaptive.lastGpuMs : 0;
+    perf.gpuClamped = this.adaptive.clampedSamples;
+    perf.frameMs = wallMs;
     perf.p50 = this.adaptive.p50;
     perf.p90 = this.adaptive.p90;
     perf.changes = this.adaptive.changes;
@@ -1447,7 +1590,15 @@ export class RenderSystem {
       scene.background = null;
       this._hideList(this._hide, this._nHide);
       this._hideList(this._noShadow, this._nNoShadow);
-      this.csm.render(renderer, scene, this._noCascadeCull ? null : this._draw, this._nDraw);
+      // One draw per soldier per cascade instead of one per material slot.
+      // The restore is in a finally: leaving a mesh on a single material would
+      // strip eight of its nine materials in the forward pass right after.
+      this.overrideBatcher?.begin(this._draw, this._nDraw);
+      try {
+        this.csm.render(renderer, scene, this._noCascadeCull ? null : this._draw, this._nDraw);
+      } finally {
+        this.overrideBatcher?.end();
+      }
       this._showList(this._noShadow, this._nNoShadow);
       this._showList(this._hide, this._nHide);
       scene.background = bg;
@@ -1464,7 +1615,15 @@ export class RenderSystem {
     if (this.needsPrepass) {
       scene.background = null;
       this._hideList(this._hide, this._nHide);
-      gb.render(renderer, scene, camera, this._currVP, this._prevVP, true);
+      this.overrideBatcher?.begin(this._draw, this._nDraw);
+      try {
+        gb.render(
+          renderer, scene, camera, this._currVP, this._prevVP, true,
+          this._masked, this._nMasked
+        );
+      } finally {
+        this.overrideBatcher?.end();
+      }
       this._showList(this._hide, this._nHide);
       scene.background = bg;
     }
@@ -1506,7 +1665,11 @@ export class RenderSystem {
     // ---- 8. forward world pass -------------------------------------------
     this.csm.uniforms.owSunDirView.value.copy(this.sunDirView);
     renderer.setRenderTarget(this.hdrRt);
-    renderer.clear(true, true, false);
+    // With the prepass depth shared in, the depth buffer is already exactly what
+    // this pass would have rebuilt, so clearing it would throw away the only
+    // thing that lets early-Z reject the hidden fragments. Colour still clears:
+    // the sky is drawn by the background, not by a clear.
+    renderer.clear(true, !this.reusePrepassDepth, false);
     renderer.render(scene, camera);
 
     // ---- 9. viewmodel ------------------------------------------------------
@@ -1622,6 +1785,11 @@ export class RenderSystem {
       const out = this.pingRt[this._pingIndex];
       vu.tColor.value = color;
       vu.tView.value = this.viewRt.texture;
+      // AFTER renderer.render( viewScene, viewCamera ) above, which is what
+      // refreshed the world matrices. Bounding them earlier would bound the
+      // weapon where it was LAST frame, and on recoil that is exactly the frame
+      // where a rectangle would cut it.
+      vu.uViewRect.value.copy(this._viewScreenRect(viewScene, viewCamera));
       this.viewComposite.render(renderer, out);
       color = out.texture;
       this._pingIndex ^= 1;
@@ -1771,6 +1939,158 @@ export class RenderSystem {
 
   _collectViewScene(viewScene) {
     viewScene.traverseVisible(this._visitView);
+  }
+
+  /**
+   * The screen rectangle outside which `ow-view-composite` may skip its five
+   * viewmodel fetches. Returned in UV, already widened by the filter reach.
+   *
+   * WHY THE SKIP IS EXACT AND NOT AN APPROXIMATION. The viewmodel target is
+   * cleared to vec4( 0 ). On a pixel whose whole five-tap diagonal neighbourhood
+   * is empty, every edgeLuma is 0, so lmax - lmin is 0, the edge test cannot
+   * fire, `v` stays at the centre tap, alpha is 0, and the pass's last line
+   * already reduces to `world` unchanged. Skipping there returns the same bits.
+   * That is also why the reach only has to cover the DIAGONAL taps: the +/-3
+   * texel FXAA arm is inside the branch, and the branch cannot be entered from a
+   * neighbourhood that is empty. One texel of taps plus one texel of coverage
+   * quantisation is 2; this ships 6. The padding is in texels of the RENDER
+   * target, and it has to be: `screenSize` and `viewComposite.uTexel` are both
+   * written from the same rw/rh inside `resize()`, and adaptive resolution only
+   * ever changes them by calling `resize()` again, so a scaled-down frame gets
+   * six of ITS OWN texels rather than six of the display's. Six and not two
+   * because the box is only 0.86 texels looser than the exact footprint at its
+   * tightest side, and two more cost 0.14% of the saving on the one object the
+   * player looks at for the whole game.
+   *
+   * WHY A BOX WHERE THE SPHERE FAILED. The first version of this unioned
+   * projected bounding SPHERES and collapsed to the whole screen on 140 frames
+   * out of 140: the viewmodel camera's near plane is 5 mm, the buttstock passes
+   * through the eye, and a sphere touching the near plane has no bounded
+   * perspective image. That was read as "no bound can exist here" and the code
+   * was deleted. It was really a statement about spheres -- the bounding sphere
+   * of a rifle has the radius of the rifle's LENGTH, so it swallows the eye from
+   * half a metre away, while a box around the same rifle is thin in two axes.
+   *
+   * WHY CLIPPING THE BOX IS SOUND. y/(-z) is linear-fractional, so its extremes
+   * over a convex polytope are attained at vertices of that polytope. The
+   * polytope is box ∩ { z <= -near }, whose vertices are the box corners already
+   * in front of the near plane plus the points where the box's twelve EDGES
+   * cross it -- a plane cuts a convex solid in a polygon whose corners lie on
+   * its edges, and there is nowhere else for one to be. Twenty candidate points
+   * at most, per mesh, and no triangle is ever visited. When a mesh cannot
+   * supply a box, or supplies one that would not bound it (skinned, morphed,
+   * instanced), this gives up to the whole screen for the frame rather than
+   * narrowing on an assumption.
+   *
+   * MEASURED, and the ceiling is measured too, which is the part that decides
+   * whether it is worth running at all. `cod viewrect` clips every drawn
+   * triangle against the near plane and bounds what the rasteriser really fills:
+   * the weapon covers 48.6% of the screen on average, 45% at the median and 73%
+   * at p90 -- not the ~15% it looks like from the couch -- so a PERFECT bound is
+   * worth 8.59 M fetches. This one averages 0.5895 of the screen against that
+   * ceiling's 0.4856: 6.86 M fetches per frame, 80% of everything available.
+   * It reaches the full screen on 43 frames of the 140-frame script and sits at
+   * 0.4591 at the median, essentially on the ceiling's own 0.4514.
+   *
+   * PRICED, and not by hand: cod fill --q=ultra --real --look=1 took
+   * ow-view-composite from 22.05 M fetches to 13.03 M, and the frame total from
+   * 396.77 M to 387.75 M. fillsim.mjs gets there by parsing the uViewRect branch
+   * out of the shipped shader and calling THIS method on the frame it is
+   * pricing, so the model cannot outlive the optimisation it is crediting.
+   *
+   * CONTAINMENT IS THE TEST, NOT AREA. `cod viewrect` reports, per frame, the
+   * texels by which the drawn footprint escapes this rectangle; it must be zero
+   * on every frame, and a positive number is the player's weapon being cut
+   * rather than a bound being tight. Over the walk/fire/ADS/reload/melee/swap
+   * script: 0 texels, 0 frames, and the margin block prints the room left over.
+   * Re-run it after touching the viewmodel, the near plane or this method.
+   */
+  _viewScreenRect(viewScene, viewCamera) {
+    const rect = this._viewRect;
+    const near = viewCamera.near;
+    const P = viewCamera.projectionMatrix.elements;
+    const vm = viewCamera.matrixWorldInverse.elements;
+    const mv = this._viewRectMv;
+    const cx = this._viewRectCx, cy = this._viewRectCy, cz = this._viewRectCz;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    let gaveUp = false;
+
+    const take = (vx, vy, vz) => {
+      const cw = P[3] * vx + P[7] * vy + P[11] * vz + P[15];
+      if (!(cw > 1e-9)) { gaveUp = true; return; }
+      const ux = (P[0] * vx + P[4] * vy + P[8] * vz + P[12]) / cw;
+      const uy = (P[1] * vx + P[5] * vy + P[9] * vz + P[13]) / cw;
+      if (ux < x0) x0 = ux;
+      if (ux > x1) x1 = ux;
+      if (uy < y0) y0 = uy;
+      if (uy > y1) y1 = uy;
+    };
+
+    viewScene.traverseVisible((o) => {
+      if (gaveUp || o.isMesh !== true) return;
+      // A bind-pose box does not bound a mesh that deforms, and an
+      // InstancedMesh draws its geometry at transforms this never looked at.
+      if (o.isSkinnedMesh === true || o.isInstancedMesh === true
+        || (o.morphTargetInfluences && o.morphTargetInfluences.length)) {
+        gaveUp = true;
+        return;
+      }
+      const geo = o.geometry;
+      const pos = geo?.attributes?.position;
+      if (!pos) { gaveUp = true; return; }
+      // Geometry that is rewritten in place -- the muzzle flash and the brass
+      // grow theirs -- invalidates the cached box, so it is recomputed exactly
+      // when the attribute says it changed and not once more.
+      if (!geo.boundingBox || geo.userData.owBoxVersion !== pos.version) {
+        geo.computeBoundingBox();
+        geo.userData.owBoxVersion = pos.version;
+      }
+      const bb = geo.boundingBox;
+      if (!bb) { gaveUp = true; return; }
+
+      const mw = o.matrixWorld.elements;
+      for (let c = 0; c < 4; c++) {
+        for (let row = 0; row < 4; row++) {
+          let s = 0;
+          for (let k = 0; k < 4; k++) s += vm[k * 4 + row] * mw[c * 4 + k];
+          mv[c * 4 + row] = s;
+        }
+      }
+
+      const bmin = bb.min, bmax = bb.max;
+      // Corner c: bit 0 picks x, bit 1 y, bit 2 z, so two corners share an edge
+      // exactly when their indices differ in one bit.
+      for (let c = 0; c < 8; c++) {
+        const lx = (c & 1) ? bmax.x : bmin.x;
+        const ly = (c & 2) ? bmax.y : bmin.y;
+        const lz = (c & 4) ? bmax.z : bmin.z;
+        cx[c] = mv[0] * lx + mv[4] * ly + mv[8] * lz + mv[12];
+        cy[c] = mv[1] * lx + mv[5] * ly + mv[9] * lz + mv[13];
+        cz[c] = mv[2] * lx + mv[6] * ly + mv[10] * lz + mv[14];
+      }
+      for (let c = 0; c < 8 && !gaveUp; c++) if (cz[c] <= -near) take(cx[c], cy[c], cz[c]);
+      for (let c = 0; c < 8 && !gaveUp; c++) {
+        for (let bit = 1; bit <= 4; bit <<= 1) {
+          const d = c | bit;
+          if (d === c) continue;            // that axis is already at max: not an edge
+          if ((cz[c] <= -near) === (cz[d] <= -near)) continue;
+          const f = (cz[c] + near) / (cz[c] - cz[d]);
+          take(cx[c] + f * (cx[d] - cx[c]), cy[c] + f * (cy[d] - cy[c]), -near);
+        }
+      }
+    });
+
+    if (gaveUp || x1 < x0) return rect.set(0, 0, 1, 1);
+
+    // NDC -> UV, then the reach allowance, then the screen. Clamping last: a
+    // rectangle that leaves the viewport is not a hole in the bound, because the
+    // side planes clip the geometry to the same edge.
+    const rx = 6 / this.screenSize.width, ry = 6 / this.screenSize.height;
+    return rect.set(
+      Math.max(0, x0 * 0.5 + 0.5 - rx),
+      Math.max(0, y0 * 0.5 + 0.5 - ry),
+      Math.min(1, x1 * 0.5 + 0.5 + rx),
+      Math.min(1, y1 * 0.5 + 0.5 + ry));
   }
 
   /**

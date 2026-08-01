@@ -10,8 +10,70 @@
   <body>
     <canvas id="game"></canvas>
     <div id="ui"></div>
-    <div id="boot" role="status" aria-live="polite" aria-atomic="false" aria-busy="true" aria-labelledby="boot-status" lang="de">
-      <div class="boot-card">
+    <div
+      id="boot"
+      class="is-awaiting-start"
+      role="dialog"
+      aria-modal="true"
+      aria-live="polite"
+      aria-atomic="false"
+      aria-busy="false"
+      aria-labelledby="start-title"
+      lang="de"
+    >
+      <section id="start-screen" class="start-card">
+        <div class="start-brand" aria-hidden="true">
+          <span>OVERWATCH</span>
+          <i></i>
+          <span>TACTICAL OPERATIONS</span>
+        </div>
+
+        <div class="start-copy">
+          <p class="start-eyebrow">Einsatzkonfiguration // Grafik</p>
+          <h1 id="start-title">Wähle dein Grafikprofil</h1>
+          <p>
+            Das Spiel wird erst nach deiner Auswahl geladen. Höhere Profile aktivieren
+            aufwendigere Schatten, Beleuchtung und Bildschirmeffekte.
+          </p>
+        </div>
+
+        <div id="start-quality-options" class="start-quality-grid" role="radiogroup" aria-label="Grafikprofil">
+          <button class="start-quality is-selected" type="button" role="radio" aria-checked="true" data-start-quality="low">
+            <span class="start-quality-head"><strong>Niedrig</strong><em>Schneller Start</em></span>
+            <span class="start-quality-spec">70 % Auflösung · 1 Schattenkaskade</span>
+            <span class="start-quality-detail">Bloom und PBR-Materialien bei maximaler Performance.</span>
+          </button>
+          <button class="start-quality" type="button" role="radio" aria-checked="false" data-start-quality="medium">
+            <span class="start-quality-head"><strong>Mittel</strong><em>Ausgewogen</em></span>
+            <span class="start-quality-spec">82 % Auflösung · TAA · GTAO</span>
+            <span class="start-quality-detail">Volumetrisches Licht und detaillierte Materialien.</span>
+          </button>
+          <button class="start-quality" type="button" role="radio" aria-checked="false" data-start-quality="high">
+            <span class="start-quality-head"><strong>Hoch</strong><em>Detailreich</em></span>
+            <span class="start-quality-spec">100 % Auflösung · SSR · 4 Kaskaden</span>
+            <span class="start-quality-detail">Reflexionen, Bewegungsunschärfe und hochauflösende Schatten.</span>
+          </button>
+          <button class="start-quality" type="button" role="radio" aria-checked="false" data-start-quality="ultra">
+            <span class="start-quality-head"><strong>Ultra</strong><em>Maximum</em></span>
+            <span class="start-quality-spec">4K-Schatten · maximale Effektbudgets</span>
+            <span class="start-quality-detail">Die höchste Grafikqualität für leistungsstarke GPUs.</span>
+          </button>
+        </div>
+
+        <div class="start-actions">
+          <button id="start-button" type="button">Spiel starten</button>
+          <div>
+            <p id="start-selection-status" aria-live="polite">Niedrig ausgewählt · für schwächere Geräte geeignet</p>
+            <p>Das Grafikprofil kann später im Pausemenü geändert werden.</p>
+          </div>
+        </div>
+
+        <noscript>
+          <p class="boot-noscript">JavaScript wird benötigt, um das Spiel zu starten.</p>
+        </noscript>
+      </section>
+
+      <div id="boot-loading" class="boot-card" aria-hidden="true">
         <div class="boot-topline">
           <div class="boot-kicker">OVERWATCH // SYSTEMSTART</div>
           <div id="boot-percent" aria-hidden="true">2%</div>

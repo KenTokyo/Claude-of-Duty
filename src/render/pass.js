@@ -35,7 +35,24 @@ export function disposeFullScreen() {
   _geometry.dispose();
 }
 
-/** A post-processing pass: a ShaderMaterial plus the uniforms it owns. */
+/**
+ * A post-processing pass: a ShaderMaterial plus the uniforms it owns.
+ *
+ * `opts.vertexShader` replaces the shared FS_VERT. It exists so a pass can hoist
+ * a frame-constant fetch out of the fragment stage and into the three vertices
+ * of the full-screen triangle — see composite.js for the worked example.
+ *
+ * THE LANGUAGE HERE IS GLSL ES 3.00 EVEN THOUGH `glslVersion` DEFAULTS TO null,
+ * and that is not obvious enough to leave unwritten. three.js emits
+ * `#version 300 es` for every material that is not a RawShaderMaterial
+ * (WebGLProgram.js, "GLSL 3.0 conversion for built-in materials and
+ * ShaderMaterial"); `glslVersion` only decides whether it ALSO defines
+ * `varying`/`texture2D`/`gl_FragColor` back to their ESSL 1.00 spellings. So the
+ * ESSL-1.00-looking shaders in this directory may use `flat` interpolation,
+ * `sampler3D` (composite.js already does) and the rest of ES 3.00 — a `flat`
+ * varying is the difference between a hoist that is provably bit-identical and
+ * one that merely interpolates three copies of the same number.
+ */
 export class Pass {
   constructor(name, fragmentShader, uniforms, opts = {}) {
     this.name = name;
@@ -43,7 +60,7 @@ export class Pass {
     this.material = new THREE.ShaderMaterial({
       name,
       uniforms,
-      vertexShader: FS_VERT,
+      vertexShader: opts.vertexShader ?? FS_VERT,
       fragmentShader,
       depthTest: false,
       depthWrite: false,

@@ -457,8 +457,17 @@ export class CascadedShadowMaps {
  * `owSunShadow()` entry point used inside the directional-light loop.
  */
 export function csmShaderChunk(cascades, quality) {
-  const blockerTaps = quality >= 3 ? 16 : quality >= 2 ? 12 : 8;
-  const pcfTaps = quality >= 3 ? 20 : quality >= 2 ? 14 : 8;
+  // Tap counts are PER FRAME, and the Vogel disc is rotated by
+  // `owIGNoise(gl_FragCoord.xy + owCsmParams.w)` — per pixel and, with TAA on,
+  // per frame over an 8-frame cycle. The temporally resolved image therefore
+  // integrates ~8x these numbers, which is why 10/16 reads the same as 16/20
+  // while costing a third less: 36 texture fetches per shadowed pixel was the
+  // single largest term in the forward pass. The blocker search is the cheaper
+  // one to cut — its output only picks a filter RADIUS, so noise in it moves a
+  // penumbra edge by a fraction of a texel rather than changing a pixel's
+  // shadow term.
+  const blockerTaps = quality >= 3 ? 10 : quality >= 2 ? 8 : 8;
+  const pcfTaps = quality >= 3 ? 16 : quality >= 2 ? 12 : 8;
   const pcss = quality >= 2;
 
   // Sampler-array-free: one 2D array texture, so the layer index can be
@@ -531,6 +540,21 @@ float owCsmCascade( int c, vec3 wPos, vec3 wN, float NdL, float rot ) {
     float gap = max( 0.0, ( recv - blocker ) * range );
     float penumbra = gap * owCsmParams.y;         // metres of penumbra
     filterR = clamp( penumbra / extent, 1.0 * invTex, maxR );
+
+    // Symmetric counterpart to the count < 0.5 early-out above. Every blocker
+    // tap in the search disc came back occluded, so the pixel sits in the umbra
+    // and the PCF loop below would sum OW_PCF_TAPS zeroes.
+    //
+    // The filterR <= searchR guard is not optional. filterR is derived from the
+    // penumbra estimate and is only clamped to maxR; if maxR ever exceeds 10
+    // texels (owCsmParams.z > 10) the PCF disc grows past the disc just proved
+    // occluded and taps would land on untested ground. With the shipped
+    // owCsmParams.z = 9 the guard is statically true -- it costs one scalar
+    // compare and keeps the shader correct if that uniform is ever raised.
+    //
+    // Measured with 'cod.mjs shadowcost', which runs both versions over every
+    // pixel of a real frame: see the outputDelta block in that command's output.
+    if ( count > float( OW_BLOCKER_TAPS ) - 0.5 && filterR <= searchR ) return 0.0;
   #endif
 
   float sum = 0.0;

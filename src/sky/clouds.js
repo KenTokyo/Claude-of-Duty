@@ -1,3 +1,5 @@
+import { f } from './atmosphere.js';
+
 /**
  * Two procedural cloud decks on the sky shell.
  *
@@ -37,6 +39,21 @@
  * units, so every direct term is divided by pi to become framebuffer radiance.
  * See the long note at the end of skRaymarchSky in atmosphere.js.
  */
+/**
+ * Deck altitudes in kilometres, and the same two numbers in the megametre units
+ * the LUTs are parameterised in.
+ *
+ * Exported because the deck irradiances are computed on the CPU now (see
+ * `transmittanceLutSample` and SkySystem._updateCelestial): the shader used to
+ * derive them from four transmittance taps per sky pixel, and a hardcoded
+ * altitude on each side of that move is exactly the kind of drift that shows up
+ * as clouds lit for a different sky than the one behind them.
+ */
+export const CLOUD_CUMULUS_KM = 1.5;
+export const CLOUD_CIRRUS_KM = 7.8;
+export const CLOUD_LOW_MM = CLOUD_CUMULUS_KM * 0.001;
+export const CLOUD_HIGH_MM = CLOUD_CIRRUS_KM * 0.001;
+
 export const CLOUDS_GLSL = /* glsl */ `
 #ifndef SKY_CLOUDS
 #define SKY_CLOUDS
@@ -46,8 +63,8 @@ uniform vec4 uCloudParams;
 // x cirrus coverage, y cirrus opacity, z wind x (km/s), w wind z (km/s)
 uniform vec4 uCloudParams2;
 
-const float SK_CUMULUS_KM = 1.5;
-const float SK_CIRRUS_KM = 7.8;
+const float SK_CUMULUS_KM = ${f(CLOUD_CUMULUS_KM)};
+const float SK_CIRRUS_KM = ${f(CLOUD_CIRRUS_KM)};
 
 /** Weather-scale coverage, in kilometres. Mirrored exactly on the CPU. */
 float skCloudMacro( vec2 p ) {
