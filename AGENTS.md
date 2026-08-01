@@ -2,8 +2,8 @@
 
 ## Zwei Pflichtregeln
 
-1. **Im Loop arbeiten:** KI muss iterieren — bis Userziel oder objektive Grenze
-2. **Keine Rückfragen:** KI muss selbst entscheiden — innerhalb Userauftrag
+1. **Im Loop arbeiten:** iterieren bis Userziel oder objektive Grenze.
+2. **Keine Rückfragen:** selbst entscheiden, innerhalb des Userauftrags.
 
 ## Zuerst lesen — nicht optional
 
@@ -11,26 +11,34 @@
 parallel arbeitenden Agenten: eigenes Verzeichnis, kein Import fremder Subsysteme, keine neuen Dependencies.
 Was dort steht, schlägt jeden Tipp aus `shared-docs`.
 
-## Learning-System (shared-docs)
+## Projekt
 
-Freiwillige Tipps, die Fehler **vor** dem Output verhindern sollen. Eine gemessen bessere Lösung
-überschreibt den Tipp — genau dafür ist er da.
+Three.js r180 · WebGL2 · Playwright · Vite 7. Keine Art-Assets — alles prozedural zur Ladezeit. Subsysteme
+liegen je in `src/<subsystem>/`. Befehle: `pnpm dev`, `check`, `glslcheck`, `shot` sowie die Gates
+`browser:batch:gate`, `browser:viewmodel:gate`, `browser:weapon:gate`, `browser:performance:gate`. Harness
+in `tools/` (`capture.mjs`, `batch-gate.mjs`, `ab.mjs`, `ab-gpu.mjs`, `baseline.mjs`, `crop.mjs` …).
 
-- **Vor 3D-Arbeit:** den passenden Fachowner aus dem [Three.js-Router](shared-docs/THREEJS-RULES.md);
-  Sweeps, Rankings und Kostenzahlen über [Messhandwerk](shared-docs/threejs/MEASURING.md).
-- **Vor Capture- und Gate-Arbeit** (`tools/capture.mjs`, `batch:gate`, `viewmodel:gate`, `weapon:gate`,
-  `performance:gate`): [Debug und Review](shared-docs/threejs/DEBUG-REVIEW.md) und
-  [SCREENSHOT-GUIDE.md](shared-docs/SCREENSHOT-GUIDE.md).
-- **Projekt-Learnings:** `shared-docs/projects/claude-of-duty/` — noch nicht angelegt, beim ersten Learning
-  anlegen. Vorlage: [voxel-samurai-quiz](shared-docs/projects/voxel-samurai-quiz/README.md).
-- **Nach der Schicht:** was Zeit gekostet hat, in zwei Zeilen mit Beleg zurückschreiben. Format,
-  Änderungsrecht und Promotion: [LEARNING-SYSTEM.md](shared-docs/LEARNING-SYSTEM.md).
-- **Submodule aktuell halten:** `git submodule update --remote shared-docs`
+## Messen und Bilder
 
-## Optionale Orientierung
+Gilt für `tools/capture.mjs` und jedes Gate:
 
-- **Status:** ausschließlich optional; bessere Lösung → Vorrang
-- **Lokaler Owner:** Three.js r180 + WebGL2, keine Art-Assets — alles prozedural zur Ladezeit
-- **Projektlokal:** [`ARCHITECTURE.md`](ARCHITECTURE.md); `docs/`; `prompt.md`; `src/<subsystem>/`
-- **Coding:** [Coding Rules](shared-docs/CODING-RULES.md)
-- **Echtzeit-3D:** [Three.js-Router](shared-docs/THREEJS-RULES.md)
+- **Zahlen vor Bildern.** Erst messen (Deckung, Luminanz, NDC-Position, Abstand), ein Bild nur wenn keine
+  Zahl die Frage beantwortet — dann genau eines. Neun Sweep-Werte sind neun Tabellenzeilen, nicht neun PNGs.
+- **Relativ vergleichen, nie in nativen Pixeln** — sonst „12 px gegen 11 px, passt", wo in Anteilen der
+  Framebreite 0,60x steht. Vor jedem Ranking Rauschboden messen und prüfen, worauf das Messfenster zeigt.
+- **Ein Prozess, viele Messungen.** Start und Shader-Warmup kosten das Doppelte bis Dreifache der Messung;
+  Aufwärm-fps sind kein Kostenmaß — auf identischem Code 83,5 gegen 44,3.
+- **Pixel aus dem Render-Target** (`readRenderTargetPixels()` aufs Post-Target), nicht `page.screenshot()`:
+  das geht über den Compositor und zeigt nicht, was der Renderer erzeugt hat.
+- **Software-Rendering ist ein Abbruch mit Fehlercode**, keine Warnung — Kennung über
+  `WEBGL_debug_renderer_info`, Match auf `swiftshader|llvmpipe|software|warp|angle \(google`. Ursache
+  hängender Rechner. Kein GPU-Flag ohne eigene Messung, `--use-angle=vulkan` ist auf NVIDIA schädlich.
+
+## Learning-System
+
+3D-Fachwissen über den Router [`shared-docs/THREEJS-RULES.md`](shared-docs/THREEJS-RULES.md), Arbeitsregeln
+in `shared-docs/CODING-RULES.md` — Tipps sind freiwillig, eine gemessen bessere Lösung schlägt jeden. Was in
+dieser Schicht Zeit gekostet hat, kommt als zwei Zeilen nach `shared-docs/projects/claude-of-duty/` (beim
+ersten Learning anlegen): Fehlerbild, Ursache, Handlung — darunter der Beleg mit Zahl und Datum. Ohne Beleg
+ist ein Tipp nicht widerlegbar; jede KI darf jeden gegen eine Gegenmessung stürzen, der gestürzte wird zum
+neuen Tipp. Regeln `shared-docs/LEARNING-SYSTEM.md`, Submodule `git submodule update --remote shared-docs`.
