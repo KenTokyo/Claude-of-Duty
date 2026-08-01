@@ -1,9 +1,10 @@
 # AGENTS — Claude of Duty
 
-## Zwei Pflichtregeln
+## Drei Pflichtregeln
 
 1. **Im Loop arbeiten:** iterieren bis Userziel oder objektive Grenze.
 2. **Keine Rückfragen:** selbst entscheiden, innerhalb des Userauftrags.
+3. **Committen und pushen:** jede kompilierfähige Einheit sofort und ungefragt — der User holt das nicht nach.
 
 ## Zuerst lesen — nicht optional
 
@@ -17,6 +18,16 @@ Three.js r180 · WebGL2 · Playwright · Vite 7. Keine Art-Assets — alles proz
 liegen je in `src/<subsystem>/`. Befehle: `pnpm dev`, `check`, `glslcheck`, `shot` sowie die Gates
 `browser:batch:gate`, `browser:viewmodel:gate`, `browser:weapon:gate`, `browser:performance:gate`. Harness
 in `tools/` (`capture.mjs`, `batch-gate.mjs`, `ab.mjs`, `ab-gpu.mjs`, `baseline.mjs`, `crop.mjs` …).
+
+## Committen und Pushen
+
+- **Nur eigene Dateien stagen**, nie `git add -A` — im Baum können fremde offene Dateien liegen.
+- **Titel einzeilig und konkret:** `typ(bereich): was`, z. B. `fix(viewmodel): Waffenversatz beim Zielen`.
+- **Ein Subsystem pro Commit** — das spiegelt die Verzeichnisgrenze aus `ARCHITECTURE.md` und hält parallel
+  arbeitende Agenten auseinander. Grüne Gates gehören zur kompilierfähigen Einheit dazu.
+- **Submodule zuerst:** in `shared-docs/` committen und pushen, danach im Hauptrepo `git add shared-docs` —
+  sonst zeigt der Pointer auf einen Commit, den keiner holen kann.
+- **Push abgelehnt:** `git pull --rebase`, Konflikt selbst sinnvoll auflösen, erneut pushen. Nicht warten.
 
 ## Messen und Bilder
 
