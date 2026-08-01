@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview --port 4173",
+    "preview": "vite preview --port 4178 --strictPort",
     "cod": "node tools/cli/cod.mjs",
     "shot": "node tools/cli/cod.mjs shot",
     "glslcheck": "node tools/cli/cod.mjs glslcheck --q=ultra",
