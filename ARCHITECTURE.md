@@ -21,8 +21,9 @@ meshes, animation and audio are generated procedurally at load time.
    `init()` and reuse. A `new THREE.Vector3()` inside `update()` is a bug.
 6. **Dispose what you create.** Geometries, materials, textures and render
    targets get freed in `dispose()`.
-7. `pnpm build` must pass and `node tools/capture.mjs` must produce a frame
-   after your change. If you break the boot, nobody else can work.
+7. `pnpm build` must pass after code changes. A capture is not a default gate: prefer direct user acceptance;
+   only unresolved visual uncertainty permits one, across the entire user task absolutely at most two reviews,
+   through the project CLI and `shared-docs/SCREENSHOT-GUIDE.md`.
 
 ## Subsystem interface
 
@@ -170,8 +171,9 @@ the post chain. Two traps:
 
 ## Quality bar
 
-Every visual subsystem is reviewed by an adversarial critic against real CoD
-frames. Non-negotiables:
+These are implementation goals, not a mandatory screenshot loop. Validate structure and numbers first and let the
+user judge the live surface directly. An independent visual critic is the unpreferred exception only when material
+Look uncertainty remains, with one, across the full task absolutely at most two reviews. Non-negotiables:
 
 - **No flat/untextured surfaces.** Every material needs albedo variation, a
   normal map, roughness variation, and a detail layer visible at 0.5 m.

@@ -17,13 +17,14 @@ liegen in `src/<subsystem>/`: eigenes Verzeichnis, kein Import fremder Subsystem
 Befehle: `pnpm dev`, `check`, `glslcheck`, `shot`; relevante Gates: `browser:batch:gate`,
 `browser:viewmodel:gate`, `browser:weapon:gate`, `browser:performance:gate`. Harness in `tools/`.
 
-- Für 3D-Facharbeit über [`shared-docs/THREEJS-RULES.md`](shared-docs/THREEJS-RULES.md) routen. Visuelle
-  Prüfungen nur über den CLI-Harness und [`shared-docs/SCREENSHOT-GUIDE.md`](shared-docs/SCREENSHOT-GUIDE.md).
+- Für 3D-Facharbeit über [`shared-docs/THREEJS-RULES.md`](shared-docs/THREEJS-RULES.md) routen. Agentische
+  Sichtprüfung ist eine ungern gesehene freiwillige Ausnahme: eine, im gesamten Userauftrag absolut höchstens zwei.
+  Falls gewählt, nur CLI-Harness und [`shared-docs/SCREENSHOT-GUIDE.md`](shared-docs/SCREENSHOT-GUIDE.md) nutzen.
 
 ## Lieferung und Wissen
 
-- Zielbranch ist **`main`**. Ein Subsystem pro Commit; passende statische und Browser-Gates gehören zur
-  kompilierfähigen Einheit.
+- Zielbranch ist **`main`**. Ein Subsystem pro Commit; passende statische Gates gehören zur kompilierfähigen
+  Einheit. Browser-/Gameplay-Gates nur auf ausdrücklichen Userbefehl.
 - Shared-Docs-Änderungen zuerst in `shared-docs/` committen und pushen, danach nur den Pointer im Hauptrepo.
   Aktualisieren: `git submodule update --remote shared-docs`.
 - Projekttipps liegen bei Bedarf unter `shared-docs/projects/claude-of-duty/`. Genau eine passende Tippdatei
