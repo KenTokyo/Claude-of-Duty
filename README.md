@@ -53,6 +53,9 @@ depth-driven effects.
 
 `ARCHITECTURE.md` is the contract the agents worked against: subsystem interface,
 directory ownership, the cross-subsystem event vocabulary, and shared surface types.
+For a plain-language walkthrough of the complete shooting feel â€” including the
+spatial red-dot effect, recoil layers, ballistics, impacts, audio and HUD feedback â€”
+see [`docs/WEAPON-JUICE-OVERVIEW.md`](docs/WEAPON-JUICE-OVERVIEW.md).
 
 ## Tooling
 
