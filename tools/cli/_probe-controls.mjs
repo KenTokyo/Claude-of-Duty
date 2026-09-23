@@ -37,6 +37,23 @@ const BUILDS = [
   ['CD', 'C+D (no wall sense, no sidestep)', [SLOPE, SIDESTEP]],
   ['BE', 'B+E (no deadline, 3D shuffle)', [STANCE, SHUFFLE3D]],
   ['DE', 'D+E (no sidestep, 3D shuffle)', [SIDESTEP, SHUFFLE3D]],
+
+  /* EXPERIMENTS — not controls. Candidate tunings for the 1.15 s tail in the
+   * "sidestep is steering and he is still stuck" bucket. */
+  ['X1', 'sidestep triggers at 0.12 s', [
+    ['if (this.stallTimer > 0.25 && wp && con?.touchingWall) {',
+      'if (this.stallTimer > 0.12 && wp && con?.touchingWall) { // EXP'],
+    ['const w = Math.min(1, (this.stallTimer - 0.25) / 0.5) * 1.6;',
+      'const w = Math.min(1, (this.stallTimer - 0.12) / 0.5) * 1.6; // EXP'],
+  ]],
+  ['X2', 'sidestep ramps in 0.25 s instead of 0.5', [
+    ['const w = Math.min(1, (this.stallTimer - 0.25) / 0.5) * 1.6;',
+      'const w = Math.min(1, (this.stallTimer - 0.25) / 0.25) * 1.6; // EXP'],
+  ]],
+  ['X3', 'sidestep weight 1.6 -> 2.6', [
+    ['const w = Math.min(1, (this.stallTimer - 0.25) / 0.5) * 1.6;',
+      'const w = Math.min(1, (this.stallTimer - 0.25) / 0.5) * 2.6; // EXP'],
+  ]],
 ];
 
 const want = process.argv.slice(2);
@@ -78,6 +95,6 @@ try {
 } finally {
   copyFileSync(BAK, SRC);
   const back = readFileSync(SRC, 'utf8');
-  console.error('restored, residue:', back.includes('// CTL'));
+  console.error('restored, residue:', back.includes('// CTL') || back.includes('// EXP'));
 }
 console.log('@@' + JSON.stringify(rows, null, 1));

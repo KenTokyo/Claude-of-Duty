@@ -1186,7 +1186,20 @@ export class Agent {
      *
      * It starts at 0.25 s, which leaves it 1.15 s to work before the watchdog
      * drops the route, and ramps over the next half second so a graze on a
-     * doorframe bends the walk rather than throwing it away. */
+     * doorframe bends the walk rather than throwing it away.
+     *
+     * ALL THREE CONSTANTS ARE MEASURED, not inherited, and all three moves are
+     * losses — do not re-derive them. Against this build's 15.7 % stall rate and
+     * 352.3 m of squad ground over 40 s:
+     *   - trigger 0.25 -> 0.12 s: 24.4 % and 303.9 m. It fires 1163 times
+     *     against 482, which is the doorframe graze the ramp exists to ignore:
+     *     55 % of the remaining stall frames are a wall brush that clears itself
+     *     inside 0.30 s, and peeling a man off his line for every one of them
+     *     costs 48 m of ground.
+     *   - ramp 0.5 -> 0.25 s: 17.8 % and 324.9 m.
+     *   - weight 1.6 -> 2.6: 17.0 % and 339.3 m, and it pushes the peek shuffle
+     *     stall to 1.43 s against a 1.5 s gate — a harder shove off the line
+     *     lands him further from the stance he was walking to. */
     const con = this.controller;
     if (this.stallTimer > 0.25 && wp && con?.touchingWall) {
       const nx = con.wallNormal.x, nz = con.wallNormal.z;
